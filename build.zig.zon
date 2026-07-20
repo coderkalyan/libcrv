@@ -1,0 +1,26 @@
+.{
+    // Package name, referenced by downstream `build.zig.zon` dependencies.
+    .name = .libcrv,
+
+    // Semantic version of this package.
+    .version = "0.1.0",
+
+    // Unique package fingerprint. Generated once; do not change it.
+    .fingerprint = 0x2507fe329a3c17e2,
+
+    // Oldest Zig toolchain this package is known to build with.
+    .minimum_zig_version = "0.16.0",
+
+    // External package dependencies. None yet.
+    .dependencies = .{},
+
+    // Files and directories that make up this package. Anything not listed
+    // here is excluded from the package hash and from published archives.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
