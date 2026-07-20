@@ -47,8 +47,8 @@ pub fn build(gpa: std.mem.Allocator) !crv.Ir {
 
     // rand bit [3:0] x;  constraint c { x inside {[0:15]}; }
     const x = try ir.addVariable(gpa, .{ .id = x_id, .ty = crv.Ir.Type.bit(4), .kind = .rand });
-    const membership = try ir.inside(gpa, try ir.varRef(gpa, x), &.{
-        try ir.range(gpa, try ir.constInt(gpa, 0), try ir.constInt(gpa, 15)),
+    const membership = try ir.in(gpa, try ir.varRef(gpa, x), &.{
+        try ir.range(gpa, try ir.constInt(gpa, 0, .bit(4)), try ir.constInt(gpa, 15, .bit(4))),
     });
     _ = try ir.addConstraint(gpa, c_id, .{}, &.{membership});
 
@@ -78,11 +78,14 @@ Because it is all plain POD arrays:
   a corrupt or tampered cache file fails cleanly rather than driving an
   allocation off a garbage count.
 
-The node tags model the SystemVerilog constraint subset (bit-vector
-randomization, relational/logical ops, `inside`, `dist`, `if`/`else`, `unique`,
-`solve...before`). See the module doc comment in [`src/Ir.zig`](src/Ir.zig) for
-the full node encoding and the roadmap (arrays/`foreach`, wide literals, string
-dedup, the solver interface).
+The node tags cover the scalar constraint subset (bit-vector randomization,
+arithmetic/relational/logical ops, `in`, `zext`/`sext`/`trunc` sizing casts,
+`dist`, `if`/`else`, `unique`, `solve...before`). A value's type is **just a bit
+width** — signedness lives on the operators (`slt`/`ult`, `sdiv`/`udiv`,
+`sra`/`srl`, `sext`/`zext`), so any op that depends on signedness comes in a
+signed and an unsigned form. Widths change only through the cast nodes. See the
+module doc comment in [`src/Ir.zig`](src/Ir.zig) for the full node encoding and
+the roadmap (arrays/`foreach`, wide literals).
 
 ## Layout
 
