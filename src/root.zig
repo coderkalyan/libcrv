@@ -11,6 +11,10 @@ pub const Ir = @import("Ir.zig");
 /// Standardized, swappable solver interface (type-erased pointer + vtable).
 pub const Solver = @import("Solver.zig");
 
+/// A rejection-sampling solver: draw random values, evaluate the IR, accept the
+/// first assignment that satisfies every constraint.
+pub const RejectionSampler = @import("RejectionSampler.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

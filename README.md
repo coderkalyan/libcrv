@@ -87,13 +87,67 @@ signed and an unsigned form. Widths change only through the cast nodes. See the
 module doc comment in [`src/Ir.zig`](src/Ir.zig) for the full node encoding and
 the roadmap (arrays/`foreach`, wide literals).
 
+## Solving
+
+`crv.Solver` is a swappable solver interface — a type-erased pointer + vtable,
+like `std.mem.Allocator` — so an engine can be chosen at runtime. Each `next`
+draws one satisfying assignment into a caller-provided `[]Value` (a `u64` per
+variable, indexed by `Variable.Index`).
+
+`crv.RejectionSampler` is the first engine: it seeds an RNG, draws a random
+value for every variable, and evaluates the whole IR over that draw, accepting
+the first assignment that satisfies every constraint. Evaluation is a single
+allocation-free linear sweep over the packed node arrays (the IR is already in
+evaluation order), so re-evaluation is tight and cache-friendly.
+
+Node values live in two parallel vectors, always allocated: a `u64` vector and
+a `std.math.big.int` vector over a limb pool. Each node is stored in one or the
+other by its width (`<= 64` bits → the `u64` vector, else the big.int vector),
+so a mostly-narrow IR keeps its narrow nodes on the fast integer path even when
+a few nodes exceed 64 bits. The big.int ops run over the preallocated pool, so
+the hot loop never allocates.
+
+Values are little-endian limb (`u64`) vectors: each variable occupies
+`Solver.valueLimbs(ir)` limbs — 1 in the common ≤64-bit case, so `out[i]` is
+just variable `i`'s value.
+
+```zig
+var sampler = try crv.RejectionSampler.init(gpa, &ir, .{ .seed = 0 });
+defer sampler.deinit(gpa);
+
+const limbs = crv.Solver.valueLimbs(&ir);      // 1 unless a variable exceeds 64 bits
+const out = try gpa.alloc(crv.Solver.Value, limbs * ir.vars.len);
+defer gpa.free(out);
+
+if (sampler.next(out)) {
+    // variable i's value is out[i * limbs ..][0..limbs]
+}
+```
+
+Evaluation is **strict and exact**: `ir.typeOf(node)` resolves every node's
+width, and each operation evaluates at that width. Widths change only through
+explicit `zext`/`sext`/`trunc` cast nodes — there is no implicit widening, so an
+operator's result is its operands' width, wrapped there. (To add two 4-bit
+values without wrapping, `zext` them to a wider type first.) Signedness is chosen
+per operation (`slt` vs `ult`, `sdiv` vs `udiv`, `sra` vs `srl`), not carried
+by the type. `ir.typeOf` resolves a node's width recursively: leaves/casts/literals are explicitly typed,
+everything else propagates its operand type or yields a 1-bit `bool`.
+
+It is incomplete — a `false` result means "no assignment found within the
+attempt budget", not "unsatisfiable". The interpreter covers the scalar
+expression subset (arithmetic/bitwise/shift, comparisons, logical ops,
+`in`/`range`) and tracks cumulative `attempts`/`hits` counters; evaluating an unsupported node
+(`dist` or the structural constraints) panics for now.
+
 ## Layout
 
 ```
-build.zig        # build graph: module, static library, test step
-build.zig.zon    # package manifest (name, version, dependencies)
-src/root.zig     # library root — the public API
-src/Ir.zig       # the flattened-tree IR
+build.zig                # build graph: module, static library, test step
+build.zig.zon            # package manifest (name, version, dependencies)
+src/root.zig             # library root — the public API
+src/Ir.zig               # the flattened-tree IR
+src/Solver.zig           # the swappable solver interface
+src/RejectionSampler.zig # the rejection-sampling engine
 ```
 
 ## License
