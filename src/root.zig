@@ -8,6 +8,9 @@ const std = @import("std");
 /// are built into, and that the solver consumes. See `Ir.zig` for the layout.
 pub const Ir = @import("Ir.zig");
 
+/// Standardized, swappable solver interface (type-erased pointer + vtable).
+pub const Solver = @import("Solver.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
