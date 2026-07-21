@@ -23,9 +23,12 @@
 //! `Solver.valueLimbs(ir)` limbs in `out` (1 in the common ≤64-bit case, so
 //! `out[i]` is just variable `i`'s value).
 //!
-//! Scope: the scalar expression subset. `dist` weighting and the structural
-//! constraints (`if_else`, `unique`, `solve_before`, `foreach`) are roadmap;
-//! evaluating one panics for now.
+//! Scope: the scalar expression subset plus `in`, `dist`, `if_else`, `unique`,
+//! and `solve_before`. `dist` is enforced as membership (an item's value is
+//! allowed when its weight is nonzero); the relative weights bias only the
+//! distribution and are not yet honored. `solve_before` is an ordering hint
+//! with no effect on a simultaneous draw, so it always holds. `foreach` needs
+//! array-typed variables, which the IR does not model yet, so it still panics.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -285,17 +288,22 @@ fn evaluate(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const I
 
             .eq, .ne, .slt, .ult, .sle, .ule, .sgt, .ugt, .sge, .uge => self.narrow[i] = @intFromBool(self.compare(tag, d)),
             .lnot, .land, .lor, .implies, .iff => self.narrow[i] = @intFromBool(self.logical(tag, d)),
-            .range => self.setVal(i, w, 0),
-            .in => self.narrow[i] = @intFromBool(self.inEval(tags, datas, d)),
 
-            .dist,
-            .dist_weight_eq,
-            .dist_weight_div,
-            .if_else,
-            .unique,
-            .solve_before,
-            .foreach,
-            => @panic("RejectionSampler: unsupported IR node"),
+            // Members consumed by their parent `in`/`dist`, not booleans on
+            // their own — evaluate to a placeholder.
+            .range, .dist_weight_eq, .dist_weight_div => self.setVal(i, w, 0),
+
+            .in => self.narrow[i] = @intFromBool(self.inEval(tags, datas, d)),
+            .dist => self.narrow[i] = @intFromBool(self.distEval(tags, datas, d)),
+            .unique => self.narrow[i] = @intFromBool(self.uniqueEval(d)),
+            .if_else => self.narrow[i] = @intFromBool(self.ifElseEval(d)),
+            // An ordering hint: it never changes which assignments are valid,
+            // and a simultaneous draw can't honor its distribution, so it holds.
+            .solve_before => self.narrow[i] = 1,
+
+            // `foreach` needs array-typed variables, which the IR does not model
+            // yet; there is nothing to iterate over.
+            .foreach => @panic("RejectionSampler: foreach requires array support (unimplemented)"),
         }
     }
 
@@ -508,32 +516,69 @@ fn logical(self: *RejectionSampler, tag: Ir.Node.Tag, d: Ir.Node.Data) bool {
     };
 }
 
+/// `value inside { members... }`: true if `value` hits any member.
 fn inEval(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const Ir.Node.Data, d: Ir.Node.Data) bool {
-    const extra = self.ir.extra.items;
-    const count = extra[d.rhs];
-    const members = extra[d.rhs + 1 ..][0..count];
-    if (self.types[d.lhs].width <= 64) {
-        const val = self.narrow[d.lhs];
-        for (members) |m| {
-            if (tags[m] == .range) {
-                const rd = datas[m];
-                if (self.narrow[rd.lhs] <= val and val <= self.narrow[rd.rhs]) return true;
-            } else if (val == self.narrow[m]) {
-                return true;
-            }
-        }
-        return false;
-    }
-    const val = self.wc(d.lhs);
-    for (members) |m| {
-        if (tags[m] == .range) {
-            const rd = datas[m];
-            if (self.wc(rd.lhs).order(val) != .gt and val.order(self.wc(rd.rhs)) != .gt) return true;
-        } else if (val.eql(self.wc(m))) {
-            return true;
-        }
+    const members = self.ir.extra.items[d.rhs + 1 ..][0..self.ir.extra.items[d.rhs]];
+    for (members) |m| if (self.memberHit(tags, datas, d.lhs, m)) return true;
+    return false;
+}
+
+/// `value dist { items... }`: true if `value` hits any item with nonzero weight
+/// (the relative weights bias distribution only and are not yet honored).
+fn distEval(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const Ir.Node.Data, d: Ir.Node.Data) bool {
+    const items = self.ir.extra.items[d.rhs + 1 ..][0..self.ir.extra.items[d.rhs]];
+    for (items) |it| {
+        const item = datas[it]; // dist_weight_*: lhs = value/range, rhs = weight
+        if (self.truthy(item.rhs) and self.memberHit(tags, datas, d.lhs, item.lhs)) return true;
     }
     return false;
+}
+
+/// `unique { nodes... }`: true if the listed values are pairwise distinct.
+fn uniqueEval(self: *RejectionSampler, d: Ir.Node.Data) bool {
+    const nodes = self.ir.extra.items[d.lhs + 1 ..][0..self.ir.extra.items[d.lhs]];
+    for (nodes, 0..) |a, k| {
+        for (nodes[k + 1 ..]) |b| if (self.valEqual(a, b)) return false;
+    }
+    return true;
+}
+
+/// `if (cond) then; else else_node;`: `(cond -> then) and (!cond -> else)`.
+fn ifElseEval(self: *RejectionSampler, d: Ir.Node.Data) bool {
+    const extra = self.ir.extra.items;
+    if (self.truthy(d.lhs)) return self.truthy(extra[d.rhs]);
+    const else_node = extra[d.rhs + 1];
+    return else_node == @intFromEnum(Ir.Node.Index.null) or self.truthy(else_node);
+}
+
+/// True if `value` matches `member`: within it when `member` is a `range`,
+/// else equal to it. Widths need not match — the comparison is numeric.
+fn memberHit(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const Ir.Node.Data, value: u32, member: u32) bool {
+    if (tags[member] == .range) {
+        const rd = datas[member];
+        return self.valLe(rd.lhs, value) and self.valLe(value, rd.rhs);
+    }
+    return self.valEqual(value, member);
+}
+
+/// Numeric equality of nodes `i` and `j`, regardless of which vector holds them.
+fn valEqual(self: *RejectionSampler, i: u32, j: u32) bool {
+    if (self.types[i].width <= 64 and self.types[j].width <= 64) return self.narrow[i] == self.narrow[j];
+    return self.constOf(i, self.t1).eql(self.constOf(j, self.t2));
+}
+
+/// Unsigned `node[i] <= node[j]`, regardless of which vector holds them.
+fn valLe(self: *RejectionSampler, i: u32, j: u32) bool {
+    if (self.types[i].width <= 64 and self.types[j].width <= 64) return self.narrow[i] <= self.narrow[j];
+    return self.constOf(i, self.t1).order(self.constOf(j, self.t2)) != .gt;
+}
+
+/// Node `i` as a `Const`, promoting a narrow value into `buf` when needed.
+fn constOf(self: *RejectionSampler, i: u32, buf: []Limb) Const {
+    if (self.types[i].width > 64) return self.wc(i);
+    var m = tmp(buf);
+    m.set(self.narrow[i]);
+    return m.toConst();
 }
 
 fn wc(self: *const RejectionSampler, i: u32) Const {
@@ -779,6 +824,124 @@ test "wide (>64-bit) literal in a constraint" {
     for (0..200) |_| {
         try std.testing.expect(sampler.next(out));
         try std.testing.expect(out[1] >= (1 << 36)); // high limb clears the bound
+    }
+}
+
+test "dist enforces membership and excludes zero-weight items" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // x dist { 5 := 0, 7 := 2, [20:22] := 1 } — 5 is excluded (weight 0), so the
+    // allowed set is {7, 20, 21, 22}.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(8), .kind = .rand });
+    const x_ref = try ir.varRef(gpa, x);
+    const excluded = try ir.distItem(gpa, .dist_weight_eq, try ir.constInt(gpa, 5, Type.bit(8)), try ir.constInt(gpa, 0, Type.bit(8)));
+    const single = try ir.distItem(gpa, .dist_weight_eq, try ir.constInt(gpa, 7, Type.bit(8)), try ir.constInt(gpa, 2, Type.bit(8)));
+    const span = try ir.distItem(gpa, .dist_weight_div, try ir.range(gpa, try ir.constInt(gpa, 20, Type.bit(8)), try ir.constInt(gpa, 22, Type.bit(8))), try ir.constInt(gpa, 1, Type.bit(8)));
+    try constraintOne(gpa, &ir, try ir.dist(gpa, x_ref, &.{ excluded, single, span }));
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 2 });
+    defer sampler.deinit(gpa);
+
+    var out: [1]Value = undefined;
+    for (0..300) |_| {
+        try std.testing.expect(sampler.next(&out));
+        try std.testing.expect(out[0] == 7 or (out[0] >= 20 and out[0] <= 22));
+    }
+}
+
+test "dist membership over a wide variable" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // 72-bit x dist { [0 : 1<<71] := 1 } — x must be <= 2^71.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(72), .kind = .rand });
+    var hi_limbs = [_]Limb{ 0, 1 << 7 }; // (1 << 7) << 64 == 1 << 71
+    const hi = try ir.constBig(gpa, .{ .limbs = &hi_limbs, .positive = true }, Type.bit(72));
+    const span = try ir.range(gpa, try ir.constInt(gpa, 0, Type.bit(72)), hi);
+    const item = try ir.distItem(gpa, .dist_weight_eq, span, try ir.constInt(gpa, 1, Type.bit(72)));
+    try constraintOne(gpa, &ir, try ir.dist(gpa, try ir.varRef(gpa, x), &.{item}));
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 8 });
+    defer sampler.deinit(gpa);
+
+    var out: [2]Value = undefined;
+    for (0..200) |_| {
+        try std.testing.expect(sampler.next(&out));
+        const x_val = (@as(u128, out[1]) << 64) | out[0];
+        try std.testing.expect(x_val <= (@as(u128, 1) << 71));
+    }
+}
+
+test "unique forces distinct values" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // Three 2-bit variables, all pairwise distinct (a permutation of 3 of {0..3}).
+    const a = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(2), .kind = .rand });
+    const b = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(2), .kind = .rand });
+    const c = try ir.addVariable(gpa, .{ .id = @enumFromInt(2), .ty = Type.bit(2), .kind = .rand });
+    try constraintOne(gpa, &ir, try ir.unique(gpa, &.{ try ir.varRef(gpa, a), try ir.varRef(gpa, b), try ir.varRef(gpa, c) }));
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 7 });
+    defer sampler.deinit(gpa);
+
+    var out: [3]Value = undefined;
+    for (0..200) |_| {
+        try std.testing.expect(sampler.next(&out));
+        try std.testing.expect(out[0] != out[1] and out[0] != out[2] and out[1] != out[2]);
+    }
+}
+
+test "if_else selects the active branch" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // if (x >= 128) x == 200;  (no else) — accepts x < 128 or x == 200.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(8), .kind = .rand });
+    const x_ref = try ir.varRef(gpa, x);
+    const cond = try ir.binary(gpa, .uge, x_ref, try ir.constInt(gpa, 128, Type.bit(8)));
+    const then_c = try ir.binary(gpa, .eq, x_ref, try ir.constInt(gpa, 200, Type.bit(8)));
+    try constraintOne(gpa, &ir, try ir.ifElse(gpa, cond, then_c, .null));
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 3 });
+    defer sampler.deinit(gpa);
+
+    var out: [1]Value = undefined;
+    var saw_low = false;
+    var saw_high = false;
+    for (0..400) |_| {
+        try std.testing.expect(sampler.next(&out));
+        try std.testing.expect(out[0] < 128 or out[0] == 200);
+        saw_low = saw_low or out[0] < 128;
+        saw_high = saw_high or out[0] == 200;
+    }
+    try std.testing.expect(saw_low and saw_high); // both branches are reachable
+}
+
+test "solve_before is a benign ordering hint" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // { a < b; solve a before b; } — the hint must not change the solution set.
+    const a = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(8), .kind = .rand });
+    const b = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(8), .kind = .rand });
+    const lt = try ir.binary(gpa, .ult, try ir.varRef(gpa, a), try ir.varRef(gpa, b));
+    const order = try ir.solveBefore(gpa, &.{a}, &.{b});
+    _ = try ir.addConstraint(gpa, @enumFromInt(0), .{}, &.{ lt, order });
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 10 });
+    defer sampler.deinit(gpa);
+
+    var out: [2]Value = undefined;
+    for (0..200) |_| {
+        try std.testing.expect(sampler.next(&out));
+        try std.testing.expect(out[0] < out[1]);
     }
 }
 

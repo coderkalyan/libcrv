@@ -139,8 +139,12 @@ everything else propagates its operand type or yields a 1-bit `bool`.
 It is incomplete — a `false` result means "no assignment found within the
 attempt budget", not "unsatisfiable". The interpreter covers the scalar
 expression subset (arithmetic/bitwise/shift, comparisons, logical ops,
-`in`/`range`) and tracks cumulative `attempts`/`hits` counters; evaluating an unsupported node
-(`dist` or the structural constraints) panics for now.
+`in`/`range`), plus `dist`, `if`/`else`, `unique`, and `solve...before`, and
+tracks cumulative `attempts`/`hits` counters. `dist` is enforced as membership
+(an item counts when its weight is nonzero); the relative weights bias only the
+distribution and are not yet honored, and `solve...before` is a pure ordering
+hint that a simultaneous draw ignores. Only `foreach` still panics — it needs
+array-typed variables, which the IR does not model yet.
 
 ## Layout
 
