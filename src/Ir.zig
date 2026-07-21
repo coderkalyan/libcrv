@@ -416,11 +416,58 @@ pub fn range(ir: *Ir, gpa: Allocator, lo: Node.Index, hi: Node.Index) Allocator.
 
 /// Set membership — SystemVerilog `value inside { members... }`.
 pub fn in(ir: *Ir, gpa: Allocator, value: Node.Index, members: []const Node.Index) Allocator.Error!Node.Index {
-    const start: u32 = @intCast(ir.extra.items.len);
-    try ir.extra.ensureUnusedCapacity(gpa, members.len + 1);
-    ir.extra.appendAssumeCapacity(@intCast(members.len));
-    for (members) |m| ir.extra.appendAssumeCapacity(@intFromEnum(m));
+    const start = try ir.addCountedList(gpa, members);
     return ir.addNode(gpa, .{ .tag = .in, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
+}
+
+/// Distribution — SystemVerilog `value dist { items... }`, each item a
+/// `distItem` node. As a constraint this requires `value` to match some item
+/// with a nonzero weight; the relative weights bias only the distribution.
+pub fn dist(ir: *Ir, gpa: Allocator, value: Node.Index, items: []const Node.Index) Allocator.Error!Node.Index {
+    const start = try ir.addCountedList(gpa, items);
+    return ir.addNode(gpa, .{ .tag = .dist, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
+}
+
+/// A `dist` item: `value_or_range := weight` (`.dist_weight_eq`) or
+/// `value_or_range :/ weight` (`.dist_weight_div`). `value_or_range` is a value
+/// or `range` node, `weight` a value node.
+pub fn distItem(ir: *Ir, gpa: Allocator, tag: Node.Tag, value_or_range: Node.Index, weight: Node.Index) Allocator.Error!Node.Index {
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{ .lhs = @intFromEnum(value_or_range), .rhs = @intFromEnum(weight) } });
+}
+
+/// `if (cond) then; else else_node;` as a constraint statement. Pass
+/// `Node.Index.null` for `else_node` when there is no `else` branch.
+pub fn ifElse(ir: *Ir, gpa: Allocator, cond: Node.Index, then_node: Node.Index, else_node: Node.Index) Allocator.Error!Node.Index {
+    const start: u32 = @intCast(ir.extra.items.len);
+    try ir.extra.appendSlice(gpa, &.{ @intFromEnum(then_node), @intFromEnum(else_node) });
+    return ir.addNode(gpa, .{ .tag = .if_else, .data = .{ .lhs = @intFromEnum(cond), .rhs = start } });
+}
+
+/// `unique { nodes... }` — every listed value must be pairwise distinct.
+pub fn unique(ir: *Ir, gpa: Allocator, nodes: []const Node.Index) Allocator.Error!Node.Index {
+    const start = try ir.addCountedList(gpa, nodes);
+    return ir.addNode(gpa, .{ .tag = .unique, .data = .{ .lhs = start } });
+}
+
+/// `solve before... before after...` — a solver ordering hint. It never changes
+/// which assignments are valid, only the distribution a complete solver draws.
+pub fn solveBefore(ir: *Ir, gpa: Allocator, before: []const Variable.Index, after: []const Variable.Index) Allocator.Error!Node.Index {
+    const start: u32 = @intCast(ir.extra.items.len);
+    try ir.extra.ensureUnusedCapacity(gpa, before.len + after.len + 2);
+    ir.extra.appendAssumeCapacity(@intCast(before.len));
+    for (before) |v| ir.extra.appendAssumeCapacity(@intFromEnum(v));
+    ir.extra.appendAssumeCapacity(@intCast(after.len));
+    for (after) |v| ir.extra.appendAssumeCapacity(@intFromEnum(v));
+    return ir.addNode(gpa, .{ .tag = .solve_before, .data = .{ .lhs = start } });
+}
+
+/// Append `[count, node0, ...]` to `extra` and return the start offset.
+fn addCountedList(ir: *Ir, gpa: Allocator, nodes: []const Node.Index) Allocator.Error!u32 {
+    const start: u32 = @intCast(ir.extra.items.len);
+    try ir.extra.ensureUnusedCapacity(gpa, nodes.len + 1);
+    ir.extra.appendAssumeCapacity(@intCast(nodes.len));
+    for (nodes) |n| ir.extra.appendAssumeCapacity(@intFromEnum(n));
+    return start;
 }
 
 // -- Accessors ---------------------------------------------------------------
@@ -783,6 +830,42 @@ test "wide integer literal round-trips" {
     var over = [_]std.math.big.Limb{ 1, 0, 1 };
     const truncated = try ir.constBig(gpa, .{ .limbs = &over, .positive = true }, Type.bit(128));
     try std.testing.expectEqual(@as(u64, 1), ir.intValue(truncated));
+}
+
+test "structural constructors build and round-trip" {
+    const gpa = std.testing.allocator;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const a = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(8), .kind = .rand });
+    const b = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(8), .kind = .rand });
+    const a_ref = try ir.varRef(gpa, a);
+    const b_ref = try ir.varRef(gpa, b);
+
+    // a dist { 1 := 3, [10:20] :/ 5 };
+    const item0 = try ir.distItem(gpa, .dist_weight_eq, try ir.constInt(gpa, 1, Type.bit(8)), try ir.constInt(gpa, 3, Type.bit(8)));
+    const item1 = try ir.distItem(gpa, .dist_weight_div, try ir.range(gpa, try ir.constInt(gpa, 10, Type.bit(8)), try ir.constInt(gpa, 20, Type.bit(8))), try ir.constInt(gpa, 5, Type.bit(8)));
+    const distribution = try ir.dist(gpa, a_ref, &.{ item0, item1 });
+
+    // unique { a, b };  if (a < b) a inside {[0:9]};  solve a before b;
+    const uniq = try ir.unique(gpa, &.{ a_ref, b_ref });
+    const cond = try ir.binary(gpa, .ult, a_ref, b_ref);
+    const then_c = try ir.in(gpa, a_ref, &.{try ir.range(gpa, try ir.constInt(gpa, 0, Type.bit(8)), try ir.constInt(gpa, 9, Type.bit(8)))});
+    const branch = try ir.ifElse(gpa, cond, then_c, .null);
+    const order = try ir.solveBefore(gpa, &.{a}, &.{b});
+
+    // Every structural node resolves to a 1-bit bool.
+    for ([_]Node.Index{ distribution, uniq, branch, order }) |n|
+        try std.testing.expectEqual(@as(u16, 1), ir.typeOf(n).width);
+
+    _ = try ir.addConstraint(gpa, @enumFromInt(0), .{}, &.{ distribution, uniq, branch, order });
+
+    const bytes = try ir.serialize(gpa);
+    defer gpa.free(bytes);
+    var ir2 = try Ir.deserialize(gpa, bytes);
+    defer ir2.deinit(gpa);
+    try std.testing.expectEqual(ir.hash(), ir2.hash());
 }
 
 test {
