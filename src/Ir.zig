@@ -41,8 +41,8 @@
 //!
 //! Scope: this is an *architectural* skeleton aimed at the SystemVerilog
 //! constraint subset (scalar bit-vector randomization). It is intentionally
-//! not complete — arrays/`foreach`, wide (>64-bit) literals, and the solver
-//! interface are staked out as tags/roadmap but not yet fleshed out.
+//! not complete — arrays/`foreach` are staked out as tags/roadmap but not yet
+//! fleshed out.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -92,12 +92,16 @@ pub const Node = struct {
 
     pub const Tag = enum(u8) {
         // -- Leaves --
-        /// Integer literal. `data` holds a 64-bit value: `lhs` = low word,
-        /// `rhs` = high word. Wider literals will spill into `extra` (roadmap).
+        /// Typed integer literal. `lhs` = `extra` index of `[nwords, word0,
+        /// word1, ...]`: a `u32` little-endian magnitude of `nwords` words
+        /// (`ceil(width / 32)`, masked to the width), length-prefixed so a
+        /// literal of any width is stored inline. `rhs` = packed `Type` (the
+        /// literal's width).
         int_literal,
-        /// Boolean literal. `lhs` is 0 or 1.
+        /// Boolean literal (a 1-bit unsigned value). `lhs` is 0 or 1.
         bool_literal,
-        /// Reference to a declared variable. `lhs` = `Variable.Index`.
+        /// Reference to a declared variable. `lhs` = `Variable.Index`; its type
+        /// is the variable's type.
         var_ref,
 
         // -- Unary: `lhs` = operand node --
@@ -108,23 +112,35 @@ pub const Node = struct {
         /// Logical negation (`!a`).
         lnot,
 
-        // -- Binary: `lhs`, `rhs` = operand nodes --
+        // -- Binary: `lhs`, `rhs` = operand nodes. Types are just widths, so
+        //    operators that depend on signedness come in signed (`s`) and
+        //    unsigned (`u`) forms. --
         add,
         sub,
         mul,
-        div,
-        mod,
+        sdiv,
+        udiv,
+        smod,
+        umod,
         band,
         bor,
         bxor,
-        shl,
-        shr,
+        /// Shift left (logical).
+        sll,
+        /// Shift right logical (zero-filling).
+        srl,
+        /// Shift right arithmetic (sign-extending).
+        sra,
         eq,
         ne,
-        lt,
-        le,
-        gt,
-        ge,
+        slt,
+        ult,
+        sle,
+        ule,
+        sgt,
+        ugt,
+        sge,
+        uge,
         land,
         lor,
         /// Implication (`a -> b`).
@@ -134,12 +150,12 @@ pub const Node = struct {
 
         // -- Sets, ranges, distributions --
         /// Inclusive range `[lo:hi]`. `lhs` = low node, `rhs` = high node.
-        /// Appears as a member of `inside`/`dist`, not as a boolean on its own.
+        /// Appears as a member of `in`/`dist`, not as a boolean on its own.
         range,
-        /// Set membership `value inside { ... }`. `lhs` = value node,
-        /// `rhs` = `extra` index of `[count, member0, member1, ...]` where each
-        /// member is a value node or a `range` node.
-        inside,
+        /// Set membership — SystemVerilog `value inside { ... }`. `lhs` = value
+        /// node, `rhs` = `extra` index of `[count, member0, member1, ...]` where
+        /// each member is a value node or a `range` node.
+        in,
         /// Distribution `value dist { ... }`. `lhs` = value node,
         /// `rhs` = `extra` index of `[count, item0, ...]` of `dist_*` nodes.
         dist,
@@ -165,6 +181,16 @@ pub const Node = struct {
         /// `[iter_var, body_count, body...]`. Roadmap: arrays are not modeled
         /// past this stub.
         foreach,
+
+        // -- Sizing casts: `lhs` = operand node, `rhs` = target bit width.
+        //    Widths only ever change through these; all other operators keep
+        //    their operands' width. --
+        /// Zero-extend to a wider, unsigned type.
+        zext,
+        /// Sign-extend to a wider, signed type.
+        sext,
+        /// Truncate to a narrower type, keeping the low bits.
+        trunc,
     };
 };
 
@@ -175,7 +201,8 @@ pub const Node = struct {
 pub const Variable = struct {
     /// Opaque caller-assigned id (see `Id`).
     id: Id,
-    /// Declared type (bit-vector width, signedness).
+    /// Bit-vector width. Signedness is not part of the type — it lives on the
+    /// operators (`slt`/`ult`, `sdiv`/`udiv`, `sext`/`zext`, ...).
     ty: Type,
     kind: Kind,
 
@@ -196,17 +223,15 @@ pub const Variable = struct {
     };
 };
 
-/// Scalar packed-vector type, e.g. `bit [7:0]` or `bit signed [31:0]`.
-/// A `packed struct(u32)` so it is one word and bit-blittable.
+/// A value's type is just its bit-vector width — signedness lives on the
+/// operators. A `packed struct(u32)` so it is one word and bit-blittable (it
+/// packs into a literal/cast node's `data`).
 pub const Type = packed struct(u32) {
     /// Bit width (`1..=65535`). `0` is reserved for "unspecified/parameterized".
     width: u16,
-    signedness: Signedness = .unsigned,
-    _reserved: u15 = 0,
+    _reserved: u16 = 0,
 
-    pub const Signedness = enum(u1) { unsigned, signed };
-
-    /// Unsigned vector of the given width — the common `rand bit [W]`.
+    /// A vector of the given width.
     pub fn bit(width: u16) Type {
         return .{ .width = width };
     }
@@ -297,15 +322,79 @@ pub fn addConstraint(
 
 // -- Convenience node constructors -------------------------------------------
 
-pub fn constInt(ir: *Ir, gpa: Allocator, value: u64) Allocator.Error!Node.Index {
-    return ir.addNode(gpa, .{ .tag = .int_literal, .data = .{
-        .lhs = @truncate(value),
-        .rhs = @truncate(value >> 32),
-    } });
+/// A typed integer literal from a 64-bit value, taken modulo `ty.width` bits.
+/// For wider constants (`ty.width > 64`), use `constBig`.
+pub fn constInt(ir: *Ir, gpa: Allocator, value: u64, ty: Type) Allocator.Error!Node.Index {
+    return ir.appendLiteral(gpa, ty, struct {
+        v: u64,
+        fn word(ctx: @This(), j: u32) u32 {
+            const bit = j * 32;
+            return if (bit >= 64) 0 else @truncate(ctx.v >> @intCast(bit));
+        }
+    }{ .v = value });
+}
+
+/// A typed integer literal from an arbitrary-precision magnitude, taken modulo
+/// `ty.width` bits. `value` is treated as an unsigned bit pattern — its sign is
+/// ignored, so to store a negative constant pass the intended two's-complement
+/// pattern (or `sext` a narrower literal).
+pub fn constBig(ir: *Ir, gpa: Allocator, value: std.math.big.int.Const, ty: Type) Allocator.Error!Node.Index {
+    return ir.appendLiteral(gpa, ty, struct {
+        v: std.math.big.int.Const,
+        fn word(ctx: @This(), j: u32) u32 {
+            const bits_per_limb = @bitSizeOf(std.math.big.Limb);
+            const limb = (@as(usize, j) * 32) / bits_per_limb;
+            if (limb >= ctx.v.limbs.len) return 0;
+            const shift = (@as(usize, j) * 32) % bits_per_limb;
+            return @truncate(ctx.v.limbs[limb] >> @intCast(shift));
+        }
+    }{ .v = value });
+}
+
+/// Number of `u32` words a `width`-bit literal magnitude occupies (`>= 1`).
+fn litWords(width: u16) u32 {
+    return @max(1, (@as(u32, width) + 31) / 32);
+}
+
+/// Mask for the most-significant `u32` word of a `width`-bit magnitude.
+fn litTopMask(width: u16) u32 {
+    const bits = @as(u32, width) - (litWords(width) - 1) * 32; // 1..=32
+    return if (bits >= 32) ~@as(u32, 0) else (@as(u32, 1) << @intCast(bits)) - 1;
+}
+
+/// Encode an `int_literal`: `[nwords, word0, ...]`, with `src.word(j)` supplying
+/// the little-endian `u32` words and the top word masked to `ty.width`.
+fn appendLiteral(ir: *Ir, gpa: Allocator, ty: Type, src: anytype) Allocator.Error!Node.Index {
+    const start: u32 = @intCast(ir.extra.items.len);
+    const n = litWords(ty.width);
+    try ir.extra.ensureUnusedCapacity(gpa, 1 + n);
+    ir.extra.appendAssumeCapacity(n);
+    var j: u32 = 0;
+    while (j < n) : (j += 1) {
+        var w = src.word(j);
+        if (j == n - 1) w &= litTopMask(ty.width);
+        ir.extra.appendAssumeCapacity(w);
+    }
+    return ir.addNode(gpa, .{ .tag = .int_literal, .data = .{ .lhs = start, .rhs = @bitCast(ty) } });
 }
 
 pub fn boolLit(ir: *Ir, gpa: Allocator, value: bool) Allocator.Error!Node.Index {
     return ir.addNode(gpa, .{ .tag = .bool_literal, .data = .{ .lhs = @intFromBool(value) } });
+}
+
+/// Zero-extend `operand` to a wider unsigned type of `width` bits.
+pub fn zext(ir: *Ir, gpa: Allocator, operand: Node.Index, width: u16) Allocator.Error!Node.Index {
+    return ir.addNode(gpa, .{ .tag = .zext, .data = .{ .lhs = @intFromEnum(operand), .rhs = width } });
+}
+
+/// Sign-extend `operand` to a wider signed type of `width` bits.
+pub fn sext(ir: *Ir, gpa: Allocator, operand: Node.Index, width: u16) Allocator.Error!Node.Index {
+    return ir.addNode(gpa, .{ .tag = .sext, .data = .{ .lhs = @intFromEnum(operand), .rhs = width } });
+}
+
+/// Truncate `operand` to a narrower type of `width` bits (keeps the low bits).
+pub fn trunc(ir: *Ir, gpa: Allocator, operand: Node.Index, width: u16) Allocator.Error!Node.Index {
+    return ir.addNode(gpa, .{ .tag = .trunc, .data = .{ .lhs = @intFromEnum(operand), .rhs = width } });
 }
 
 pub fn varRef(ir: *Ir, gpa: Allocator, v: Variable.Index) Allocator.Error!Node.Index {
@@ -320,26 +409,71 @@ pub fn binary(ir: *Ir, gpa: Allocator, tag: Node.Tag, lhs: Node.Index, rhs: Node
     return ir.addNode(gpa, .{ .tag = tag, .data = .{ .lhs = @intFromEnum(lhs), .rhs = @intFromEnum(rhs) } });
 }
 
-/// Inclusive range `[lo:hi]`, for use inside `inside`/`dist` member lists.
+/// Inclusive range `[lo:hi]`, for use as an `in`/`dist` member.
 pub fn range(ir: *Ir, gpa: Allocator, lo: Node.Index, hi: Node.Index) Allocator.Error!Node.Index {
     return ir.addNode(gpa, .{ .tag = .range, .data = .{ .lhs = @intFromEnum(lo), .rhs = @intFromEnum(hi) } });
 }
 
-/// `value inside { members... }`.
-pub fn inside(ir: *Ir, gpa: Allocator, value: Node.Index, members: []const Node.Index) Allocator.Error!Node.Index {
+/// Set membership — SystemVerilog `value inside { members... }`.
+pub fn in(ir: *Ir, gpa: Allocator, value: Node.Index, members: []const Node.Index) Allocator.Error!Node.Index {
     const start: u32 = @intCast(ir.extra.items.len);
     try ir.extra.ensureUnusedCapacity(gpa, members.len + 1);
     ir.extra.appendAssumeCapacity(@intCast(members.len));
     for (members) |m| ir.extra.appendAssumeCapacity(@intFromEnum(m));
-    return ir.addNode(gpa, .{ .tag = .inside, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
+    return ir.addNode(gpa, .{ .tag = .in, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
 }
 
 // -- Accessors ---------------------------------------------------------------
 
-/// The 64-bit value of an `int_literal` node.
+/// The low 64 bits of an `int_literal` node's magnitude. For a literal wider
+/// than 64 bits this drops the high bits; read `extra` directly (or reconstruct
+/// a big int) when the full magnitude is needed.
 pub fn intValue(ir: *const Ir, node: Node.Index) u64 {
     const d = ir.nodes.items(.data)[@intFromEnum(node)];
-    return @as(u64, d.lhs) | (@as(u64, d.rhs) << 32);
+    const n = ir.extra.items[d.lhs];
+    const lo = ir.extra.items[d.lhs + 1];
+    const hi = if (n >= 2) ir.extra.items[d.lhs + 2] else 0;
+    return @as(u64, lo) | (@as(u64, hi) << 32);
+}
+
+/// The declared type of an `int_literal` node.
+pub fn literalType(ir: *const Ir, node: Node.Index) Type {
+    return @bitCast(ir.nodes.items(.data)[@intFromEnum(node)].rhs);
+}
+
+/// The target width of a `zext`/`sext`/`trunc` node.
+pub fn castWidth(ir: *const Ir, node: Node.Index) u16 {
+    return @intCast(ir.nodes.items(.data)[@intFromEnum(node)].rhs);
+}
+
+/// Width assumed for a variable declared without an explicit one.
+pub const default_width: u16 = 32;
+
+/// Recursively resolve a node's type — its bit-vector width. Leaves, literals,
+/// and casts are explicitly typed; every other operator propagates its left
+/// operand's width, and comparisons/logical operators yield a 1-bit `bool`.
+/// Widths only ever change through the `zext`/`sext`/`trunc` casts.
+pub fn typeOf(ir: *const Ir, node: Node.Index) Type {
+    const i = @intFromEnum(node);
+    const d = ir.nodes.items(.data)[i];
+    return switch (ir.nodes.items(.tag)[i]) {
+        .int_literal => ir.literalType(node),
+        .bool_literal => .{ .width = 1 },
+        .var_ref => varType(ir.vars.items(.ty)[d.lhs]),
+
+        .zext, .sext, .trunc => .{ .width = ir.castWidth(node) },
+
+        .neg, .bnot => ir.typeOf(@enumFromInt(d.lhs)),
+        .add, .sub, .mul, .sdiv, .udiv, .smod, .umod, .band, .bor, .bxor, .sll, .srl, .sra => ir.typeOf(@enumFromInt(d.lhs)),
+        .range => ir.typeOf(@enumFromInt(d.lhs)),
+
+        .eq, .ne, .slt, .ult, .sle, .ule, .sgt, .ugt, .sge, .uge, .lnot, .land, .lor, .implies, .iff, .in => .{ .width = 1 },
+        .dist, .dist_weight_eq, .dist_weight_div, .if_else, .unique, .solve_before, .foreach => .{ .width = 1 },
+    };
+}
+
+fn varType(t: Type) Type {
+    return if (t.width == 0) .{ .width = default_width } else t;
 }
 
 /// The statement nodes making up a constraint block's body.
@@ -404,7 +538,7 @@ pub fn hash(ir: *const Ir) Digest {
 /// Identifies a libcrv cache blob.
 pub const magic: [4]u8 = .{ 'C', 'R', 'V', 'B' };
 /// On-disk format version. Bump on any layout change; readers reject mismatches.
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 3;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first section: `magic` + `format_version`.
@@ -537,10 +671,10 @@ test "build, hash, and round-trip a small constraint set" {
     const x = try ir.addVariable(gpa, .{ .id = x_id, .ty = Type.bit(4), .kind = .rand });
 
     const x_ref = try ir.varRef(gpa, x);
-    const lo = try ir.constInt(gpa, 0);
-    const hi = try ir.constInt(gpa, 15);
+    const lo = try ir.constInt(gpa, 0, Type.bit(4));
+    const hi = try ir.constInt(gpa, 15, Type.bit(4));
     const zero_to_15 = try ir.range(gpa, lo, hi);
-    const membership = try ir.inside(gpa, x_ref, &.{zero_to_15});
+    const membership = try ir.in(gpa, x_ref, &.{zero_to_15});
 
     _ = try ir.addConstraint(gpa, c_id, .{}, &.{membership});
 
@@ -568,7 +702,7 @@ test "build, hash, and round-trip a small constraint set" {
 
     const body = ir2.constraintBody(@enumFromInt(0));
     try std.testing.expectEqual(@as(usize, 1), body.len);
-    try std.testing.expectEqual(Node.Tag.inside, ir2.nodes.items(.tag)[@intFromEnum(body[0])]);
+    try std.testing.expectEqual(Node.Tag.in, ir2.nodes.items(.tag)[@intFromEnum(body[0])]);
 }
 
 test "cache format is versioned and checksum-protected" {
@@ -576,7 +710,7 @@ test "cache format is versioned and checksum-protected" {
 
     var ir: Ir = .{};
     defer ir.deinit(gpa);
-    _ = try ir.constInt(gpa, 42);
+    _ = try ir.constInt(gpa, 42, Type.bit(8));
 
     const bytes = try ir.serialize(gpa);
     defer gpa.free(bytes);
@@ -604,6 +738,51 @@ test "cache format is versioned and checksum-protected" {
     @memcpy(bad_version[0..magic.len], &magic);
     std.mem.writeInt(u32, bad_version[4..8], format_version + 1, .little);
     try std.testing.expectError(error.UnsupportedVersion, Ir.deserialize(gpa, &bad_version));
+}
+
+test "typeOf resolves recursively" {
+    const gpa = std.testing.allocator;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const u = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(8), .kind = .rand });
+    const sum = try ir.binary(gpa, .add, try ir.varRef(gpa, u), try ir.constInt(gpa, 3, Type.bit(8)));
+    const wide = try ir.zext(gpa, sum, 16); // 16-bit
+    const back = try ir.trunc(gpa, wide, 8); // 8-bit
+    const cmp = try ir.binary(gpa, .ult, try ir.varRef(gpa, u), sum); // 1-bit bool
+
+    try std.testing.expectEqual(Type.bit(8), ir.typeOf(sum));
+    try std.testing.expectEqual(@as(u16, 16), ir.typeOf(wide).width);
+    try std.testing.expectEqual(@as(u16, 8), ir.typeOf(back).width);
+    try std.testing.expectEqual(@as(u16, 1), ir.typeOf(cmp).width);
+}
+
+test "wide integer literal round-trips" {
+    const gpa = std.testing.allocator;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // A 128-bit constant with bits set above 64: (1 << 100) | 0xdead_beef.
+    var limbs = [_]std.math.big.Limb{ 0xdead_beef, 1 << 36 };
+    const value: std.math.big.int.Const = .{ .limbs = &limbs, .positive = true };
+    const lit = try ir.constBig(gpa, value, Type.bit(128));
+
+    try std.testing.expectEqual(@as(u16, 128), ir.typeOf(lit).width);
+    // `intValue` exposes the low 64 bits.
+    try std.testing.expectEqual(@as(u64, 0xdead_beef), ir.intValue(lit));
+    // The high bits survive: serialize/deserialize preserves the content hash.
+    const bytes = try ir.serialize(gpa);
+    defer gpa.free(bytes);
+    var ir2 = try Ir.deserialize(gpa, bytes);
+    defer ir2.deinit(gpa);
+    try std.testing.expectEqual(ir.hash(), ir2.hash());
+
+    // A too-wide value is taken modulo the width: bit 128 is dropped at bit(128).
+    var over = [_]std.math.big.Limb{ 1, 0, 1 };
+    const truncated = try ir.constBig(gpa, .{ .limbs = &over, .positive = true }, Type.bit(128));
+    try std.testing.expectEqual(@as(u64, 1), ir.intValue(truncated));
 }
 
 test {
