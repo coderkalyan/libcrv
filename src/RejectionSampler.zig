@@ -209,9 +209,43 @@ fn draw(self: *RejectionSampler) void {
     }
 }
 
+/// Store an `int_literal` into node `i`'s slot. The literal is `[nwords, ...]`
+/// in `extra`; narrow literals read the low words directly, wide ones assemble
+/// the full magnitude and truncate it into the wide vector.
+fn litVal(self: *RejectionSampler, i: u32, w: u16, d: Ir.Node.Data) void {
+    if (w <= 64) {
+        self.setVal(i, w, self.litValue(d));
+    } else {
+        const c = self.litConst(d, self.t1);
+        var r = self.wm(i);
+        r.truncate(c, .unsigned, w);
+        self.storeW(i, r);
+    }
+}
+
+/// The low 64 bits of the literal at `d` (its top two `u32` words).
 inline fn litValue(self: *const RejectionSampler, d: Ir.Node.Data) u64 {
     const e = self.ir.extra.items;
-    return @as(u64, e[d.lhs]) | (@as(u64, e[d.lhs + 1]) << 32);
+    const n = e[d.lhs];
+    const lo: u64 = e[d.lhs + 1];
+    const hi: u64 = if (n >= 2) e[d.lhs + 2] else 0;
+    return lo | (hi << 32);
+}
+
+/// Assemble the full magnitude of the literal at `d` into `buf` (little-endian
+/// `u32` words repacked into `Limb`s), returning it as a `Const`.
+fn litConst(self: *const RejectionSampler, d: Ir.Node.Data, buf: []Limb) Const {
+    const e = self.ir.extra.items;
+    const words = e[d.lhs + 1 ..][0..e[d.lhs]];
+    const per_limb = @bitSizeOf(Limb) / 32;
+    const nlimbs = (words.len + per_limb - 1) / per_limb;
+    for (buf[0..nlimbs]) |*l| l.* = 0;
+    for (words, 0..) |word, j| {
+        buf[j / per_limb] |= @as(Limb, word) << @intCast(32 * (j % per_limb));
+    }
+    var len = nlimbs;
+    while (len > 1 and buf[len - 1] == 0) len -= 1;
+    return .{ .limbs = buf[0..len], .positive = true };
 }
 
 fn evaluate(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const Ir.Node.Data) bool {
@@ -220,7 +254,7 @@ fn evaluate(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const I
         const i: u32 = @intCast(iu);
         const w = ty[i].width;
         switch (tag) {
-            .int_literal => self.setVal(i, w, self.litValue(d)),
+            .int_literal => self.litVal(i, w, d),
             .bool_literal => self.setVal(i, w, d.lhs),
             .var_ref => self.varRef(i, w, d.lhs),
 
@@ -721,6 +755,30 @@ test "wide (>64-bit) unsigned modulo" {
         try std.testing.expect(sampler.next(out));
         const x_val = (@as(u128, out[1]) << 64) | out[0];
         try std.testing.expectEqual(@as(u128, 7), x_val % 100);
+    }
+}
+
+test "wide (>64-bit) literal in a constraint" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // 128-bit x; constraint { x >= (1 << 100) } — a bound whose only set bit is
+    // above word 1, so it exercises the wide-literal storage.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(128), .kind = .rand });
+    var limbs = [_]Limb{ 0, 1 << 36 }; // (1 << 36) << 64 == 1 << 100
+    const bound = try ir.constBig(gpa, .{ .limbs = &limbs, .positive = true }, Type.bit(128));
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .uge, try ir.varRef(gpa, x), bound));
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 5 });
+    defer sampler.deinit(gpa);
+
+    const vl = Solver.valueLimbs(&ir);
+    const out = try gpa.alloc(Value, vl);
+    defer gpa.free(out);
+    for (0..200) |_| {
+        try std.testing.expect(sampler.next(out));
+        try std.testing.expect(out[1] >= (1 << 36)); // high limb clears the bound
     }
 }
 

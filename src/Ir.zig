@@ -41,8 +41,8 @@
 //!
 //! Scope: this is an *architectural* skeleton aimed at the SystemVerilog
 //! constraint subset (scalar bit-vector randomization). It is intentionally
-//! not complete — arrays/`foreach`, wide (>64-bit) literals, and the solver
-//! interface are staked out as tags/roadmap but not yet fleshed out.
+//! not complete — arrays/`foreach` are staked out as tags/roadmap but not yet
+//! fleshed out.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -92,8 +92,10 @@ pub const Node = struct {
 
     pub const Tag = enum(u8) {
         // -- Leaves --
-        /// Typed integer literal. `lhs` = `extra` index of `[value_lo,
-        /// value_hi]` (the 64-bit magnitude); `rhs` = packed `Type` (the
+        /// Typed integer literal. `lhs` = `extra` index of `[nwords, word0,
+        /// word1, ...]`: a `u32` little-endian magnitude of `nwords` words
+        /// (`ceil(width / 32)`, masked to the width), length-prefixed so a
+        /// literal of any width is stored inline. `rhs` = packed `Type` (the
         /// literal's width).
         int_literal,
         /// Boolean literal (a 1-bit unsigned value). `lhs` is 0 or 1.
@@ -320,10 +322,59 @@ pub fn addConstraint(
 
 // -- Convenience node constructors -------------------------------------------
 
-/// A typed integer literal: the value is taken modulo `ty.width` bits.
+/// A typed integer literal from a 64-bit value, taken modulo `ty.width` bits.
+/// For wider constants (`ty.width > 64`), use `constBig`.
 pub fn constInt(ir: *Ir, gpa: Allocator, value: u64, ty: Type) Allocator.Error!Node.Index {
+    return ir.appendLiteral(gpa, ty, struct {
+        v: u64,
+        fn word(ctx: @This(), j: u32) u32 {
+            const bit = j * 32;
+            return if (bit >= 64) 0 else @truncate(ctx.v >> @intCast(bit));
+        }
+    }{ .v = value });
+}
+
+/// A typed integer literal from an arbitrary-precision magnitude, taken modulo
+/// `ty.width` bits. `value` is treated as an unsigned bit pattern — its sign is
+/// ignored, so to store a negative constant pass the intended two's-complement
+/// pattern (or `sext` a narrower literal).
+pub fn constBig(ir: *Ir, gpa: Allocator, value: std.math.big.int.Const, ty: Type) Allocator.Error!Node.Index {
+    return ir.appendLiteral(gpa, ty, struct {
+        v: std.math.big.int.Const,
+        fn word(ctx: @This(), j: u32) u32 {
+            const bits_per_limb = @bitSizeOf(std.math.big.Limb);
+            const limb = (@as(usize, j) * 32) / bits_per_limb;
+            if (limb >= ctx.v.limbs.len) return 0;
+            const shift = (@as(usize, j) * 32) % bits_per_limb;
+            return @truncate(ctx.v.limbs[limb] >> @intCast(shift));
+        }
+    }{ .v = value });
+}
+
+/// Number of `u32` words a `width`-bit literal magnitude occupies (`>= 1`).
+fn litWords(width: u16) u32 {
+    return @max(1, (@as(u32, width) + 31) / 32);
+}
+
+/// Mask for the most-significant `u32` word of a `width`-bit magnitude.
+fn litTopMask(width: u16) u32 {
+    const bits = @as(u32, width) - (litWords(width) - 1) * 32; // 1..=32
+    return if (bits >= 32) ~@as(u32, 0) else (@as(u32, 1) << @intCast(bits)) - 1;
+}
+
+/// Encode an `int_literal`: `[nwords, word0, ...]`, with `src.word(j)` supplying
+/// the little-endian `u32` words and the top word masked to `ty.width`.
+fn appendLiteral(ir: *Ir, gpa: Allocator, ty: Type, src: anytype) Allocator.Error!Node.Index {
     const start: u32 = @intCast(ir.extra.items.len);
-    try ir.extra.appendSlice(gpa, &.{ @truncate(value), @truncate(value >> 32) });
+    const n = litWords(ty.width);
+    try ir.extra.ensureUnusedCapacity(gpa, 1 + n);
+    ir.extra.appendAssumeCapacity(n);
+    var j: u32 = 0;
+    while (j < n) : (j += 1) {
+        var w = src.word(j);
+        if (j == n - 1) w &= litTopMask(ty.width);
+        ir.extra.appendAssumeCapacity(w);
+    }
     return ir.addNode(gpa, .{ .tag = .int_literal, .data = .{ .lhs = start, .rhs = @bitCast(ty) } });
 }
 
@@ -374,11 +425,14 @@ pub fn in(ir: *Ir, gpa: Allocator, value: Node.Index, members: []const Node.Inde
 
 // -- Accessors ---------------------------------------------------------------
 
-/// The 64-bit magnitude of an `int_literal` node.
+/// The low 64 bits of an `int_literal` node's magnitude. For a literal wider
+/// than 64 bits this drops the high bits; read `extra` directly (or reconstruct
+/// a big int) when the full magnitude is needed.
 pub fn intValue(ir: *const Ir, node: Node.Index) u64 {
     const d = ir.nodes.items(.data)[@intFromEnum(node)];
-    const lo = ir.extra.items[d.lhs];
-    const hi = ir.extra.items[d.lhs + 1];
+    const n = ir.extra.items[d.lhs];
+    const lo = ir.extra.items[d.lhs + 1];
+    const hi = if (n >= 2) ir.extra.items[d.lhs + 2] else 0;
     return @as(u64, lo) | (@as(u64, hi) << 32);
 }
 
@@ -484,7 +538,7 @@ pub fn hash(ir: *const Ir) Digest {
 /// Identifies a libcrv cache blob.
 pub const magic: [4]u8 = .{ 'C', 'R', 'V', 'B' };
 /// On-disk format version. Bump on any layout change; readers reject mismatches.
-pub const format_version: u32 = 2;
+pub const format_version: u32 = 3;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first section: `magic` + `format_version`.
@@ -702,6 +756,33 @@ test "typeOf resolves recursively" {
     try std.testing.expectEqual(@as(u16, 16), ir.typeOf(wide).width);
     try std.testing.expectEqual(@as(u16, 8), ir.typeOf(back).width);
     try std.testing.expectEqual(@as(u16, 1), ir.typeOf(cmp).width);
+}
+
+test "wide integer literal round-trips" {
+    const gpa = std.testing.allocator;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // A 128-bit constant with bits set above 64: (1 << 100) | 0xdead_beef.
+    var limbs = [_]std.math.big.Limb{ 0xdead_beef, 1 << 36 };
+    const value: std.math.big.int.Const = .{ .limbs = &limbs, .positive = true };
+    const lit = try ir.constBig(gpa, value, Type.bit(128));
+
+    try std.testing.expectEqual(@as(u16, 128), ir.typeOf(lit).width);
+    // `intValue` exposes the low 64 bits.
+    try std.testing.expectEqual(@as(u64, 0xdead_beef), ir.intValue(lit));
+    // The high bits survive: serialize/deserialize preserves the content hash.
+    const bytes = try ir.serialize(gpa);
+    defer gpa.free(bytes);
+    var ir2 = try Ir.deserialize(gpa, bytes);
+    defer ir2.deinit(gpa);
+    try std.testing.expectEqual(ir.hash(), ir2.hash());
+
+    // A too-wide value is taken modulo the width: bit 128 is dropped at bit(128).
+    var over = [_]std.math.big.Limb{ 1, 0, 1 };
+    const truncated = try ir.constBig(gpa, .{ .limbs = &over, .positive = true }, Type.bit(128));
+    try std.testing.expectEqual(@as(u64, 1), ir.intValue(truncated));
 }
 
 test {

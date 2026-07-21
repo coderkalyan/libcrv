@@ -83,9 +83,12 @@ arithmetic/relational/logical ops, `in`, `zext`/`sext`/`trunc` sizing casts,
 `dist`, `if`/`else`, `unique`, `solve...before`). A value's type is **just a bit
 width** — signedness lives on the operators (`slt`/`ult`, `sdiv`/`udiv`,
 `sra`/`srl`, `sext`/`zext`), so any op that depends on signedness comes in a
-signed and an unsigned form. Widths change only through the cast nodes. See the
-module doc comment in [`src/Ir.zig`](src/Ir.zig) for the full node encoding and
-the roadmap (arrays/`foreach`, wide literals).
+signed and an unsigned form. Widths change only through the cast nodes.
+Constants come from `constInt` (a 64-bit value) or `constBig` (an
+arbitrary-precision `std.math.big.int.Const`); both are stored inline at their
+declared width, so literals wider than 64 bits are first-class. See the module
+doc comment in [`src/Ir.zig`](src/Ir.zig) for the full node encoding and the
+roadmap (arrays/`foreach`).
 
 ## Solving
 
