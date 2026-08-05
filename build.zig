@@ -4,12 +4,57 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The SMT backend is opt-in, and off by default: libcrv builds and tests
+    // with no external dependency at all. Enabling it links a system-installed
+    // libbitwuzla, which itself pulls in GMP, MPFR, and a SAT solver.
+    //
+    //     zig build -Dbitwuzla \
+    //         -Dbitwuzla-include=/usr/local/include \
+    //         -Dbitwuzla-lib=/usr/local/lib
+    //
+    // `SmtSampler` defaults to CryptoMiniSat as the SAT engine, so libbitwuzla
+    // should be built with CryptoMiniSat support; see `SmtSampler.Options`.
+    const bitwuzla = b.option(
+        bool,
+        "bitwuzla",
+        "Link the Bitwuzla SMT backend, enabling crv.SmtSampler (default: false)",
+    ) orelse false;
+    const bitwuzla_include = b.option(
+        []const u8,
+        "bitwuzla-include",
+        "Directory containing bitwuzla/c/bitwuzla.h",
+    );
+    const bitwuzla_lib = b.option(
+        []const u8,
+        "bitwuzla-lib",
+        "Directory containing libbitwuzla",
+    );
+
+    // Two files with the same public API; the rest of the library is written
+    // against that API and so compiles identically either way.
+    const backend = b.createModule(.{
+        .root_source_file = b.path(if (bitwuzla)
+            "src/bitwuzla/enabled.zig"
+        else
+            "src/bitwuzla/disabled.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (bitwuzla) {
+        if (bitwuzla_include) |dir| backend.addIncludePath(.{ .cwd_relative = dir });
+        if (bitwuzla_lib) |dir| backend.addLibraryPath(.{ .cwd_relative = dir });
+        backend.link_libc = true;
+        backend.link_libcpp = true;
+        backend.linkSystemLibrary("bitwuzla", .{});
+    }
+
     // The library's root module. Downstream projects add this repository as a
     // dependency and import it with `@import("crv")`.
     const mod = b.addModule("crv", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "bitwuzla", .module = backend }},
     });
 
     // Static library artifact. Handy for C consumers and for verifying that
