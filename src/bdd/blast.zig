@@ -16,7 +16,7 @@
 //! than being quietly reinterpreted — which also means operand vectors can be
 //! read in place instead of copied through a width-fitting temporary. The one
 //! exception is a shift amount, which is a count rather than a value of the
-//! operand's type and may be any width.
+//! operand's type and so carries its own width (`Ir.shiftAmountWidth`).
 //!
 //! **What is expensive.** Bit-blasting is where a BDD engine gets to be fast or
 //! gets to explode, and the difference is not subtle:
@@ -429,8 +429,9 @@ const Blaster = struct {
 
     fn shift(b: *Blaster, out: []Ref, tag: Ir.Node.Tag, d: Ir.Node.Data, w: u16) Error!void {
         // The shifted value carries the result width by construction; the
-        // amount is a count, not a value of that type, so it may be any width.
+        // amount is a count with its own width — see `Ir.shiftAmountWidth`.
         std.debug.assert(b.width(d.lhs) == w);
+        std.debug.assert(b.width(d.rhs) == Ir.shiftAmountWidth(w));
         const a = b.vec(d.lhs);
         const amount = b.vec(d.rhs);
         // For `sra` the sign comes from the result width, matching the sampler.
@@ -439,12 +440,10 @@ const Blaster = struct {
         var cur = try b.tmp(w);
         @memcpy(cur, a);
 
-        // Barrel shifter: one mux stage per bit of the shift amount that can
-        // matter. Stages beyond `w` would shift everything out, and are folded
-        // into `too_far` below.
-        const stages = std.math.log2_int_ceil(u32, @max(2, w));
-        for (0..@min(stages, amount.len)) |k| {
-            if (amount[k] == .zero) continue;
+        // Barrel shifter: one mux stage per bit of the amount. Every bit is
+        // meaningful now that the amount is sized to the operand.
+        for (amount, 0..) |selector, k| {
+            if (selector == .zero) continue;
             const step = @as(usize, 1) << @intCast(k);
             const next = try b.tmp(w);
             for (next, 0..) |*o, bit| {
@@ -452,21 +451,22 @@ const Blaster = struct {
                     .sll => if (bit >= step) cur[bit - step] else fill,
                     else => if (bit + step < w) cur[bit + step] else fill,
                 };
-                o.* = try b.m.ite(amount[k], from, cur[bit]);
+                o.* = try b.m.ite(selector, from, cur[bit]);
             }
             cur = next;
         }
 
-        // A shift of `w` or more saturates: zero, or all-sign for `sra`. The
-        // comparison is done at a width that can actually represent `w`, so a
-        // narrow shift operand does not wrap the bound around to zero.
-        const need = std.math.log2_int_ceil(u32, @as(u32, w) + 1);
-        const cmp_width: u16 = @intCast(@max(amount.len, need));
-        const amt = try b.tmp(cmp_width);
-        fitU(amt, amount);
-        const bound = try b.constVec(cmp_width, w);
-        const too_far = try b.ugeChain(amt, bound);
-
+        // A shift of `w` or more saturates: zero, or all-sign for `sra`. When
+        // `w` is a power of two the amount is exactly wide enough to express
+        // `0..w-1` and nothing else, so the bound can never be reached and the
+        // whole check is skipped rather than emitted as dead nodes.
+        const representable = @as(u32, 1) << @intCast(amount.len);
+        if (representable <= w) {
+            @memcpy(out, cur);
+            return;
+        }
+        const bound = try b.constVec(@intCast(amount.len), w);
+        const too_far = try b.ugeChain(amount, bound);
         for (out, cur) |*o, x| o.* = try b.m.ite(too_far, fill, x);
     }
 

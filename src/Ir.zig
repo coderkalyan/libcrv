@@ -125,11 +125,14 @@ pub const Node = struct {
         band,
         bor,
         bxor,
-        /// Shift left (logical).
+        /// Shift left (logical). `rhs` is a shift *amount*, not a value of the
+        /// shifted operand's type, so it carries its own width — see
+        /// `shiftAmountWidth`.
         sll,
-        /// Shift right logical (zero-filling).
+        /// Shift right logical (zero-filling). See `sll` for the amount's width.
         srl,
-        /// Shift right arithmetic (sign-extending).
+        /// Shift right arithmetic (sign-extending). See `sll` for the amount's
+        /// width.
         sra,
         eq,
         ne,
@@ -448,6 +451,22 @@ pub fn castWidth(ir: *const Ir, node: Node.Index) u16 {
 
 /// Width assumed for a variable declared without an explicit one.
 pub const default_width: u16 = 32;
+
+/// The width a shift amount must have to shift a `width`-bit value.
+///
+/// Unlike the operands of an arithmetic or relational operator, which all share
+/// the node's one type, a shift amount is a *count*. It therefore carries its
+/// own width: exactly the `ceil(log2(width))` bits needed to express every
+/// in-range shift, and at least one.
+///
+/// Sizing it this way is what makes an out-of-range shift *unrepresentable*
+/// whenever `width` is a power of two — the common case — so a consumer can
+/// drop its saturation handling entirely there rather than emitting a bounds
+/// check that can never fire.
+pub fn shiftAmountWidth(width: u16) u16 {
+    if (width <= 2) return 1;
+    return std.math.log2_int_ceil(u16, width);
+}
 
 /// Recursively resolve a node's type — its bit-vector width. Leaves, literals,
 /// and casts are explicitly typed; every other operator propagates its left
@@ -884,6 +903,36 @@ test "wide integer literal round-trips" {
     var over = [_]std.math.big.Limb{ 1, 0, 1 };
     const truncated = try ir.constBig(gpa, .{ .limbs = &over, .positive = true }, Type.bit(128));
     try std.testing.expectEqual(@as(u64, 1), ir.intValue(truncated));
+}
+
+test "a shift amount is sized to span exactly the in-range shifts" {
+    // Enough bits to express `width - 1`, and never more.
+    try std.testing.expectEqual(@as(u16, 1), shiftAmountWidth(1));
+    try std.testing.expectEqual(@as(u16, 1), shiftAmountWidth(2));
+    try std.testing.expectEqual(@as(u16, 2), shiftAmountWidth(3));
+    try std.testing.expectEqual(@as(u16, 2), shiftAmountWidth(4));
+    try std.testing.expectEqual(@as(u16, 3), shiftAmountWidth(5));
+    try std.testing.expectEqual(@as(u16, 3), shiftAmountWidth(8));
+    try std.testing.expectEqual(@as(u16, 5), shiftAmountWidth(32));
+    try std.testing.expectEqual(@as(u16, 6), shiftAmountWidth(64));
+    try std.testing.expectEqual(@as(u16, 16), shiftAmountWidth(65535));
+
+    var width: u16 = 1;
+    while (width < 1024) : (width += 1) {
+        const bits = shiftAmountWidth(width);
+        const representable = @as(u32, 1) << @intCast(bits);
+        // Every in-range shift fits...
+        try std.testing.expect(representable >= width);
+        // ...and one bit fewer would not suffice.
+        try std.testing.expect(bits == 1 or representable / 2 < width);
+        // At a power-of-two width nothing out of range is even representable,
+        // which is what lets a consumer drop its bounds check there. Width 1 is
+        // the one exception: its only legal shift is 0, but there is no
+        // zero-width type to say so, so the amount keeps a bit that saturates.
+        if (width > 1 and std.math.isPowerOfTwo(width)) {
+            try std.testing.expectEqual(@as(u32, width), representable);
+        }
+    }
 }
 
 test {

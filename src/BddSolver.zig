@@ -636,11 +636,16 @@ fn expectSameSolutions(gpa: Allocator, ir: *const Ir, n: usize) !void {
     while (it.next()) |key| try testing.expect(from_bdd.contains(key.*));
 }
 
-/// `constraint { op(x, y) == k }` over two `width`-bit variables.
+/// `constraint { op(x, y) == k }`. When `tag` is a shift, `y` is an *amount*
+/// and takes the width the IR requires of one, not the operand's width.
 fn binaryEqIr(gpa: Allocator, ir: *Ir, tag: Ir.Node.Tag, k: u64, width: u16) !void {
     const ty = Type.bit(width);
+    const rhs_ty = switch (tag) {
+        .sll, .srl, .sra => Type.bit(Ir.shiftAmountWidth(width)),
+        else => ty,
+    };
     const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = ty, .kind = .rand });
-    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = ty, .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = rhs_ty, .kind = .rand });
     const op = try ir.binary(gpa, tag, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
     try constrain(gpa, ir, try ir.binary(gpa, .eq, op, try ir.constInt(gpa, k, ty)));
 }
@@ -651,16 +656,21 @@ test "differential: arithmetic operators agree with the rejection sampler" {
         .add,  .sub, .mul,  .udiv, .umod, .sdiv, .smod,
         .band, .bor, .bxor, .sll,  .srl,  .sra,
     };
-    // 0 exercises the division-by-zero path; 15 exercises the all-ones edge.
-    for (tags) |tag| {
-        for ([_]u64{ 0, 1, 7, 15 }) |k| {
-            var ir: Ir = .{};
-            defer ir.deinit(gpa);
-            try binaryEqIr(gpa, &ir, tag, k, 4);
-            expectSameSolutions(gpa, &ir, 2) catch |err| {
-                std.debug.print("mismatch on {t} == {d}\n", .{ tag, k });
-                return err;
-            };
+    // Both sides of the shift-saturation branch: width 4 is a power of two, so
+    // a 2-bit amount spans exactly 0..3 and can never be out of range, while
+    // width 5 gives a 3-bit amount whose top three values do saturate.
+    // k = 0 exercises the division-by-zero path, 15 the all-ones edge.
+    for ([_]u16{ 4, 5 }) |width| {
+        for (tags) |tag| {
+            for ([_]u64{ 0, 1, 7, 15 }) |k| {
+                var ir: Ir = .{};
+                defer ir.deinit(gpa);
+                try binaryEqIr(gpa, &ir, tag, k, width);
+                expectSameSolutions(gpa, &ir, 2) catch |err| {
+                    std.debug.print("mismatch on {t} == {d} at width {d}\n", .{ tag, k, width });
+                    return err;
+                };
+            }
         }
     }
 }
