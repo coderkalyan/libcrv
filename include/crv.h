@@ -4,33 +4,38 @@
  * This is the C interface to the Zig library: build a constraint set into an
  * IR, hash or cache it, then draw satisfying assignments from it.
  *
- *     crv_ir *ir = crv_ir_new();
+ *     crv_ir ir;
+ *     crv_ir_init(&ir);
  *
  *     crv_var x;
  *     crv_node xr, lo, hi, rng, member;
- *     crv_var_add(ir, 1, 4, CRV_VAR_RAND, &x);        // rand bit [3:0] x;
- *     crv_node_var(ir, x, &xr);
- *     crv_node_const_u64(ir, 0, 4, &lo);
- *     crv_node_const_u64(ir, 15, 4, &hi);
- *     crv_node_range(ir, lo, hi, &rng);               // [0:15]
- *     crv_node_in(ir, xr, &rng, 1, &member);          // x inside {[0:15]}
- *     crv_constraint_add(ir, 2, 0, &member, 1, NULL); // constraint c { ... }
+ *     crv_var_add(&ir, 1, 4, CRV_VAR_RAND, &x);        // rand bit [3:0] x;
+ *     crv_node_var(&ir, x, &xr);
+ *     crv_node_const_u64(&ir, 0, 4, &lo);
+ *     crv_node_const_u64(&ir, 15, 4, &hi);
+ *     crv_node_range(&ir, lo, hi, &rng);               // [0:15]
+ *     crv_node_in(&ir, xr, &rng, 1, &member);          // x inside {[0:15]}
+ *     crv_constraint_add(&ir, 2, 0, &member, 1, NULL); // constraint c { ... }
  *
  *     crv_solver *s;
- *     crv_rejection_sampler_new(ir, NULL, &s);
+ *     crv_rejection_sampler_new(&ir, NULL, &s);
  *
  *     uint64_t values[1];
  *     if (crv_solver_next(s, values, 1) == CRV_OK) { ... values[0] ... }
  *
  *     crv_solver_free(s);
- *     crv_ir_free(ir);
+ *     crv_ir_deinit(&ir);
  *
  * Ownership and lifetimes:
  *
- *   - A `crv_ir` owns everything reachable from it; free it with `crv_ir_free`.
- *   - A `crv_solver` borrows its `crv_ir`, which must outlive it. Mutating an
- *     IR that a solver is bound to is detected, not tolerated: the next call
- *     to `crv_solver_next` returns `CRV_ERR_STALE`.
+ *   - A `crv_ir` is a value you place wherever you like — on the stack, in a
+ *     struct, in an arena. The library never allocates it; `crv_ir_init` sets
+ *     it up and `crv_ir_deinit` releases the arrays hanging off it.
+ *   - A `crv_solver` is an opaque handle the library does allocate, because
+ *     its size depends on the engine behind it. Free it with `crv_solver_free`.
+ *   - A `crv_solver` borrows its `crv_ir`, which must outlive it and must not
+ *     be modified while it does. Adding to an IR a solver is bound to is
+ *     undefined behaviour, not a detected error.
  *   - No buffer is ever passed across the library boundary for the caller to
  *     free. Where the library produces bytes, the caller supplies the storage.
  *
@@ -82,12 +87,10 @@ typedef enum crv_status {
     CRV_ERR_INVALID_IR = -5,
     /* The IR contains a node this solver engine cannot evaluate. */
     CRV_ERR_UNSUPPORTED_NODE = -6,
-    /* The IR was modified after the solver was bound to it. */
-    CRV_ERR_STALE = -7,
-    CRV_ERR_BAD_MAGIC = -8,
-    CRV_ERR_UNSUPPORTED_VERSION = -9,
-    CRV_ERR_CHECKSUM_MISMATCH = -10,
-    CRV_ERR_TRUNCATED = -11
+    CRV_ERR_BAD_MAGIC = -7,
+    CRV_ERR_UNSUPPORTED_VERSION = -8,
+    CRV_ERR_CHECKSUM_MISMATCH = -9,
+    CRV_ERR_TRUNCATED = -10
 } crv_status;
 
 /* A short, static description of `status`. Never null. */
@@ -99,7 +102,21 @@ const char *crv_status_string(crv_status status);
  * pointers, and are only meaningful against the `crv_ir` that produced them.
  * On failure a builder writes `CRV_INVALID` through its out-parameter.
  */
-typedef struct crv_ir crv_ir;
+
+/* An IR, as storage rather than as a pointer: `crv_ir` is exactly as large and
+ * as aligned as the library's own representation, so C code can hold one by
+ * value without a definition of it. The bytes are private — read or write them
+ * and you are on your own. The buffer carries slack deliberately, and the
+ * library refuses to compile if its representation ever outgrows it, so the
+ * size is checked rather than assumed. */
+typedef union crv_ir {
+    unsigned char private_storage[128];
+    /* Never accessed. Present only to give the union the alignment the
+     * library's representation requires. */
+    uint64_t private_align_int;
+    void *private_align_ptr;
+} crv_ir;
+
 typedef struct crv_solver crv_solver;
 
 typedef uint32_t crv_node;
@@ -112,9 +129,11 @@ typedef uint32_t crv_constraint;
 
 /* -- IR lifetime ---------------------------------------------------------- */
 
-/* A new, empty IR, or NULL if out of memory. */
-crv_ir *crv_ir_new(void);
-void crv_ir_free(crv_ir *ir);
+/* Set up an empty IR in caller-provided storage. Cannot fail: an empty IR owns
+ * nothing yet. Pair with `crv_ir_deinit`, which is safe on any initialized IR
+ * whatever happened in between. */
+void crv_ir_init(crv_ir *ir);
+void crv_ir_deinit(crv_ir *ir);
 
 /* Pre-size the IR's arrays. Purely a performance hint: building works
  * without it, `extra` is the payload pool for variable-arity nodes. */
@@ -238,7 +257,8 @@ crv_status crv_node_binary(crv_ir *ir, crv_op op, crv_node a, crv_node b,
 crv_status crv_node_cast(crv_ir *ir, crv_cast cast, crv_node a, uint16_t width,
                          crv_node *out);
 
-/* The width a node evaluates at. */
+/* The width a node evaluates at. Resolved by walking the node's operand chain,
+ * so it costs the depth of the expression, not constant time. */
 crv_status crv_node_width(const crv_ir *ir, crv_node n, uint16_t *out_width);
 
 /* -- Sets, distributions, structural constraints -------------------------- */
@@ -319,16 +339,18 @@ size_t crv_ir_serialized_size(const crv_ir *ir);
 crv_status crv_ir_serialize(const crv_ir *ir, void *buf, size_t cap,
                             size_t *written);
 
-/* Rebuild an IR from bytes written by `crv_ir_serialize`, into a new handle
- * the caller must free. The checksum is verified before any length in the blob
- * is trusted, and the result is validated before it is returned, so a corrupt
- * or hostile blob fails with a status rather than producing an IR that reads
- * out of bounds later. */
-crv_status crv_ir_deserialize(const void *buf, size_t len, crv_ir **out);
+/* Rebuild an IR from bytes written by `crv_ir_serialize`, into storage the
+ * caller supplies — which must not already hold an initialized IR, since this
+ * initializes it in place of `crv_ir_init`. The checksum is verified before
+ * any length in the blob is trusted, and the result is validated before it is
+ * returned, so a corrupt or hostile blob fails with a status rather than
+ * producing an IR that reads out of bounds later. A rejected blob leaves `*out`
+ * empty rather than untouched, so it is still safe to `crv_ir_deinit`. */
+crv_status crv_ir_deserialize(const void *buf, size_t len, crv_ir *out);
 
 /* -- Solving --------------------------------------------------------------
  *
- * A solution is a vector of little-endian 64-bit words: `crv_value_words(ir)`
+ * A solution is a vector of little-endian 64-bit words: `crv_value_words(&ir)`
  * words per variable, so variable `i` occupies
  * `values[i * words .. (i + 1) * words]`, and `values[i]` is simply variable
  * `i`'s value in the common case where every variable fits in 64 bits.
@@ -350,7 +372,8 @@ typedef struct crv_rejection_options {
  *
  * The IR is validated here, and rejected with `CRV_ERR_UNSUPPORTED_NODE` if it
  * uses a node this engine cannot evaluate (`dist` weighting or the structural
- * constraints, today). It must outlive the solver. */
+ * constraints, today). It must outlive the solver, and must not be modified
+ * while the solver exists. */
 crv_status crv_rejection_sampler_new(const crv_ir *ir,
                                      const crv_rejection_options *options,
                                      crv_solver **out);
@@ -358,7 +381,7 @@ crv_status crv_rejection_sampler_new(const crv_ir *ir,
 void crv_solver_free(crv_solver *solver);
 
 /* Draw one satisfying assignment into `values`, which must hold at least
- * `crv_value_words(ir) * crv_var_count(ir)` words. Returns `CRV_OK` with the
+ * `crv_value_words(&ir) * crv_var_count(&ir)` words. Returns `CRV_OK` with the
  * buffer filled, or `CRV_EXHAUSTED` if the engine gave up. */
 crv_status crv_solver_next(crv_solver *solver, uint64_t *values, size_t nwords);
 

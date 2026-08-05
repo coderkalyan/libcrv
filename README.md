@@ -158,26 +158,27 @@ giving up partway through a draw.
 
 `zig build` installs `libcrv.a`, `libcrv.so` and `crv.h`. The header is
 hand-written and declaration-only, so bindgen, cffi and DPI can all parse it.
-Handles are opaque; nodes, variables and constraints are `uint32_t` indices
-into the IR that produced them.
+Nodes, variables and constraints are `uint32_t` indices into the IR that
+produced them.
 
 ```c
 #include <crv.h>
 
-crv_ir *ir = crv_ir_new();
+crv_ir ir;
+crv_ir_init(&ir);
 
 crv_var x;
 crv_node xr, lo, hi, rng, member;
-crv_var_add(ir, /*id=*/1, /*width=*/4, CRV_VAR_RAND, &x);  // rand bit [3:0] x;
-crv_node_var(ir, x, &xr);
-crv_node_const_u64(ir, 3, 4, &lo);
-crv_node_const_u64(ir, 7, 4, &hi);
-crv_node_range(ir, lo, hi, &rng);                          // [3:7]
-crv_node_in(ir, xr, &rng, 1, &member);                     // x inside {[3:7]}
-crv_constraint_add(ir, /*id=*/2, 0, &member, 1, NULL);
+crv_var_add(&ir, /*id=*/1, /*width=*/4, CRV_VAR_RAND, &x); // rand bit [3:0] x;
+crv_node_var(&ir, x, &xr);
+crv_node_const_u64(&ir, 3, 4, &lo);
+crv_node_const_u64(&ir, 7, 4, &hi);
+crv_node_range(&ir, lo, hi, &rng);                         // [3:7]
+crv_node_in(&ir, xr, &rng, 1, &member);                    // x inside {[3:7]}
+crv_constraint_add(&ir, /*id=*/2, 0, &member, 1, NULL);
 
 crv_solver *s;
-crv_rejection_sampler_new(ir, NULL, &s);
+crv_rejection_sampler_new(&ir, NULL, &s);
 
 uint64_t values[1];
 if (crv_solver_next(s, values, 1) == CRV_OK) {
@@ -185,8 +186,17 @@ if (crv_solver_next(s, values, 1) == CRV_OK) {
 }
 
 crv_solver_free(s);
-crv_ir_free(ir);
+crv_ir_deinit(&ir);
 ```
+
+A `crv_ir` is a value, not a handle: it is the Zig `Ir` struct seen through a
+fixed-size, suitably aligned byte buffer, so C code places it on the stack or
+inside its own structures and the library never allocates it. (The library
+refuses to compile if `Ir` ever outgrows that buffer, so the size is checked
+rather than assumed.) `crv_solver` stays an opaque, library-allocated handle,
+because its size depends on the engine behind it and a header constant sized to
+the largest one would become an ABI liability the moment a heavier backend
+lands.
 
 Every call returns a `crv_status` and writes its result through a trailing
 out-parameter (`NULL` to discard); negative statuses are hard errors, and
@@ -196,18 +206,19 @@ a, b, &out)` entry point rather than one export per operator, and the `crv_op`
 values are mapped to IR tags explicitly, so the internal tag ordering is free
 to change without breaking a compiled consumer.
 
-The C layer adds no logic of its own — it is argument checking plus a call into
-the Zig core — but it does check what Zig's type system would otherwise catch:
-indices are bounds-checked, operand widths must agree (`CRV_ERR_WIDTH_MISMATCH`;
-change width with `crv_node_cast`), deserialized blobs are validated, a solver
-refuses an IR containing a node it cannot evaluate, and mutating an IR that a
-solver is bound to makes the next `crv_solver_next` return `CRV_ERR_STALE`
-instead of reading a stale node-type table. Nothing in the library ever panics
-a C caller's process, and no buffer crosses the boundary for the caller to
-free: where the library produces bytes, the caller supplies the storage.
+The C layer adds no logic and no state of its own — it is argument checking plus
+a call into the Zig core — but it does check what Zig's type system would
+otherwise catch: indices are bounds-checked, operand widths must agree
+(`CRV_ERR_WIDTH_MISMATCH`; change width with `crv_node_cast`), deserialized
+blobs are validated, and a solver refuses an IR containing a node it cannot
+evaluate. What it deliberately does not do is defend a C caller from hazards a
+Zig caller also has: a solver borrows its IR, and appending to that IR while the
+solver lives is undefined for both. No buffer crosses the boundary for the
+caller to free: where the library produces bytes, the caller supplies the
+storage.
 
 Solutions come back in the same layout Zig sees — little-endian 64-bit words,
-`crv_value_words(ir)` per variable — so there is no marshalling in either
+`crv_value_words(&ir)` per variable — so there is no marshalling in either
 direction; wide literals go in the same way through `crv_node_const_bits`.
 
 ## Layout
