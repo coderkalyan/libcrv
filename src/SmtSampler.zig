@@ -179,7 +179,9 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Error!SmtSampler {
     var analysis = try Analysis.run(gpa, ir, .{});
     errdefer analysis.deinit(gpa);
 
-    const free_mask = try gpa.alloc(Limb, @max(stride, 1));
+    // Exactly `stride`, not one more: `next` iterates it alongside the output
+    // and a solution slot, and the three lengths have to agree.
+    const free_mask = try gpa.alloc(Limb, stride);
     errdefer gpa.free(free_mask);
     fillFreeMask(ir, &analysis, free_mask, value_limbs);
 
