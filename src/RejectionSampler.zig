@@ -196,6 +196,27 @@ pub fn next(self: *RejectionSampler, out: []Value) bool {
     return false;
 }
 
+/// Evaluate the constraint set over a caller-supplied assignment instead of a
+/// drawn one, returning whether it satisfies every constraint.
+///
+/// This is the reference oracle: it is the same evaluator `next` accepts draws
+/// with, so another engine can be checked against it assignment by assignment.
+/// `values` is laid out like a solution buffer (`Solver.valueLimbs(ir)` limbs
+/// per variable) and each value is assumed already masked to its width.
+pub fn check(self: *RejectionSampler, values: []const Value) bool {
+    const total = self.value_limbs * self.ir.vars.len;
+    std.debug.assert(values.len >= total);
+
+    for (values[0..total], self.vbuf[0..total]) |src, *dst| dst.* = src;
+    for (self.vars, 0..) |vi, v| {
+        const region = self.vbuf[v * self.value_limbs ..][0..self.value_limbs];
+        var len = vi.used;
+        while (len > 1 and region[len - 1] == 0) len -= 1;
+        self.vlen[v] = len;
+    }
+    return self.evaluate(self.ir.nodes.items(.tag), self.ir.nodes.items(.data));
+}
+
 fn draw(self: *RejectionSampler) void {
     const vl = self.value_limbs;
     for (self.vars, 0..) |vi, v| {

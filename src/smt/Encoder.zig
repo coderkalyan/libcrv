@@ -467,3 +467,281 @@ fn limbsTerm(e: *Encoder, sort: bw.Sort, value: []const Solver.Value, width: u16
     e.lit_buf[width] = 0;
     return e.tm.bvValueBin(sort, e.lit_buf[0..width :0]);
 }
+
+// -- Tests -------------------------------------------------------------------
+//
+// The encoder is the foundation every later phase stands on: support
+// minimization, counting, and sampling all assume the term it built means what
+// the IR node meant. So it is checked against the reference evaluator
+// *exhaustively* rather than by spot-checking interesting inputs -- for a
+// handful of narrow variables the whole assignment space is a few thousand
+// points, and enumerating it catches the disagreements nobody thought to look
+// for. Every case below is one where the naive mapping is wrong.
+
+const RejectionSampler = @import("../RejectionSampler.zig");
+const Type = Ir.Type;
+
+/// Check that Bitwuzla and the interpreter agree on *every* assignment.
+///
+/// Each variable is pinned to a candidate value and the result compared with
+/// the evaluator's verdict on the same assignment, so a disagreement is
+/// reported as the exact point where the two engines diverge.
+fn expectAgreement(gpa: Allocator, ir: *const Ir) !void {
+    if (!bw.available) return error.SkipZigTest;
+
+    var sampler = try RejectionSampler.init(gpa, ir, .{});
+    defer sampler.deinit(gpa);
+
+    const tm = bw.TermManager.init();
+    defer tm.deinit();
+    const opts = bw.Options.init();
+    defer opts.deinit();
+
+    var enc = try Encoder.encode(gpa, ir, tm, .{});
+    defer enc.deinit(gpa);
+
+    const session = bw.Session.init(tm, opts);
+    defer session.deinit();
+    enc.assertAll(session);
+
+    const limbs = Solver.valueLimbs(ir);
+    const nvars = ir.vars.len;
+    const values = try gpa.alloc(Solver.Value, @max(limbs * nvars, 1));
+    defer gpa.free(values);
+
+    // Odometer over the variables' full ranges. Widths are kept small enough
+    // by the callers that the whole product is a few thousand points.
+    var total: u64 = 1;
+    for (0..nvars) |v| {
+        const w = enc.var_widths[v];
+        std.debug.assert(w <= 8);
+        total *= @as(u64, 1) << @intCast(w);
+    }
+
+    var point: u64 = 0;
+    while (point < total) : (point += 1) {
+        @memset(values, 0);
+        var rest = point;
+        for (0..nvars) |v| {
+            const span = @as(u64, 1) << @intCast(enc.var_widths[v]);
+            values[v * limbs] = rest % span;
+            rest /= span;
+        }
+
+        const expected = sampler.check(values);
+
+        session.push(1);
+        for (0..nvars) |v| {
+            const sort = tm.bvSort(enc.var_widths[v]);
+            session.assert(tm.term2(
+                .equal,
+                enc.varTerm(@enumFromInt(@as(u32, @intCast(v)))),
+                tm.bvValueU64(sort, values[v * limbs]),
+            ));
+        }
+        const actual = session.checkSat() == .sat;
+        session.pop(1);
+
+        if (expected != actual) {
+            std.debug.print(
+                "encoder disagrees with the interpreter at point {d}: " ++
+                    "interpreter={}, bitwuzla={}\n",
+                .{ point, expected, actual },
+            );
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+fn constraintOne(gpa: Allocator, ir: *Ir, node: Ir.Node.Index) !void {
+    _ = try ir.addConstraint(gpa, @enumFromInt(0), .{}, &.{node});
+}
+
+test "division by zero agrees with the interpreter" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // SMT-LIB says `bvudiv x 0` is all ones and `bvurem x 0` is x; the IR says
+    // both are 0. Encoding either bare would disagree on every y == 0.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(4), .kind = .rand });
+    const q = try ir.binary(gpa, .udiv, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    const r = try ir.binary(gpa, .urem, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .eq, q, r));
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "signed division and remainder agree with the interpreter" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // Covers the divide-by-zero guard and the minInt / -1 corner, where the
+    // interpreter's wrapping negate has to line up with `bvsdiv`.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(4), .kind = .rand });
+    const q = try ir.binary(gpa, .sdiv, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    const r = try ir.binary(gpa, .srem, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .ne, q, r));
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "shifts agree when the amount can overshoot the width" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // A 6-bit amount against a 4-bit value: amounts above 3 shift everything
+    // out. Narrowing the amount to 4 bits instead would wrap 16 back to 0 and
+    // leave the value untouched.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const s = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(6), .kind = .rand });
+    const left = try ir.binary(gpa, .sll, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    const right = try ir.binary(gpa, .srl, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    const arith = try ir.binary(gpa, .sra, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    const both = try ir.binary(gpa, .eq, left, right);
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .lor, both, try ir.binary(gpa, .eq, arith, left)));
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "signed and unsigned comparisons agree with the interpreter" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(5), .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(5), .kind = .rand });
+    const signed = try ir.binary(gpa, .slt, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    const unsigned = try ir.binary(gpa, .ult, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    // True exactly where the two orderings disagree, i.e. across the sign bit.
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .ne, signed, unsigned));
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "casts and truncation agree with the interpreter" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const wide = try ir.sext(gpa, try ir.varRef(gpa, x), 8);
+    const narrowed = try ir.trunc(gpa, wide, 4);
+    const zeroed = try ir.zext(gpa, try ir.varRef(gpa, x), 8);
+    // sext then trunc round-trips; sext and zext differ exactly on negatives.
+    const round_trip = try ir.binary(gpa, .eq, narrowed, try ir.varRef(gpa, x));
+    const differs = try ir.binary(gpa, .ne, wide, zeroed);
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .land, round_trip, differs));
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "set membership agrees with the interpreter" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // `in` compares unsigned, so [10:3] is empty rather than reversed.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(5), .kind = .rand });
+    const membership = try ir.in(gpa, try ir.varRef(gpa, x), &.{
+        try ir.range(gpa, try ir.constInt(gpa, 3, Type.bit(5)), try ir.constInt(gpa, 9, Type.bit(5))),
+        try ir.constInt(gpa, 20, Type.bit(5)),
+        try ir.range(gpa, try ir.constInt(gpa, 10, Type.bit(5)), try ir.constInt(gpa, 3, Type.bit(5))),
+    });
+    try constraintOne(gpa, &ir, membership);
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "boolean connectives over bit-vector operands agree" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // Mixes Bool-sorted results with a bit-vector read for truth, which is
+    // where the Bool/BV(1) coercions get exercised in both directions.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(4), .kind = .rand });
+    const cmp = try ir.binary(gpa, .ult, try ir.varRef(gpa, x), try ir.varRef(gpa, y));
+    const masked = try ir.binary(gpa, .band, try ir.varRef(gpa, x), try ir.constInt(gpa, 1, Type.bit(4)));
+    const implication = try ir.binary(gpa, .implies, cmp, masked);
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .lor, implication, try ir.unary(gpa, .lnot, cmp)));
+
+    try expectAgreement(gpa, &ir);
+}
+
+test "conditional constraints agree with the interpreter" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(4), .kind = .rand });
+    const cond = try ir.binary(gpa, .ugt, try ir.varRef(gpa, x), try ir.constInt(gpa, 7, Type.bit(4)));
+    const then_stmt = try ir.binary(gpa, .eq, try ir.varRef(gpa, y), try ir.constInt(gpa, 0, Type.bit(4)));
+    const else_stmt = try ir.binary(gpa, .ugt, try ir.varRef(gpa, y), try ir.constInt(gpa, 0, Type.bit(4)));
+    const payload = try ir.addExtra(gpa, &.{ @intFromEnum(then_stmt), @intFromEnum(else_stmt) });
+    const node = try ir.addNode(gpa, .{
+        .tag = .if_else,
+        .data = .{ .lhs = @intFromEnum(cond), .rhs = @intFromEnum(payload) },
+    });
+    try constraintOne(gpa, &ir, node);
+
+    // The interpreter does not model `if_else`, so only the encoder side is
+    // exercised here: the constraint must be satisfiable and must force y to
+    // zero exactly when x exceeds 7.
+    if (!bw.available) return error.SkipZigTest;
+
+    const tm = bw.TermManager.init();
+    defer tm.deinit();
+    const opts = bw.Options.init();
+    defer opts.deinit();
+    var enc = try Encoder.encode(gpa, &ir, tm, .{});
+    defer enc.deinit(gpa);
+    const session = bw.Session.init(tm, opts);
+    defer session.deinit();
+    enc.assertAll(session);
+
+    const sort = tm.bvSort(4);
+    for (0..16) |xv| {
+        for (0..16) |yv| {
+            session.push(1);
+            session.assert(tm.term2(.equal, enc.varTerm(@enumFromInt(0)), tm.bvValueU64(sort, xv)));
+            session.assert(tm.term2(.equal, enc.varTerm(@enumFromInt(1)), tm.bvValueU64(sort, yv)));
+            const sat = session.checkSat() == .sat;
+            session.pop(1);
+
+            const want = if (xv > 7) yv == 0 else yv > 0;
+            try std.testing.expectEqual(want, sat);
+        }
+    }
+}
+
+test "unsupported nodes are rejected rather than ignored" {
+    const gpa = std.testing.allocator;
+    if (!bw.available) return error.SkipZigTest;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const payload = try ir.addExtra(gpa, &.{ 1, 0, 1, 1 });
+    const node = try ir.addNode(gpa, .{
+        .tag = .solve_before,
+        .data = .{ .lhs = @intFromEnum(payload) },
+    });
+    _ = x;
+    try constraintOne(gpa, &ir, node);
+
+    const tm = bw.TermManager.init();
+    defer tm.deinit();
+    try std.testing.expectError(error.Unsupported, Encoder.encode(gpa, &ir, tm, .{}));
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}

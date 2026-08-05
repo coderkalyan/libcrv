@@ -82,8 +82,12 @@ The node tags cover the scalar constraint subset (bit-vector randomization,
 arithmetic/relational/logical ops, `in`, `zext`/`sext`/`trunc` sizing casts,
 `dist`, `if`/`else`, `unique`, `solve...before`). A value's type is **just a bit
 width** — signedness lives on the operators (`slt`/`ult`, `sdiv`/`udiv`,
-`sra`/`srl`, `sext`/`zext`), so any op that depends on signedness comes in a
-signed and an unsigned form. Widths change only through the cast nodes.
+`srem`/`urem`, `sra`/`srl`, `sext`/`zext`), so any op that depends on signedness
+comes in a signed and an unsigned form. `srem` is truncated remainder — its sign
+follows the dividend, as `@rem` and SMT-LIB's `bvsrem` do, not `bvsmod` — and
+every division yields 0 on a zero divisor, which SMT-LIB does *not* agree with,
+so a backend has to encode that guard explicitly. Widths change only through the
+cast nodes.
 Constants come from `constInt` (a 64-bit value) or `constBig` (an
 arbitrary-precision `std.math.big.int.Const`); both are stored inline at their
 declared width, so literals wider than 64 bits are first-class. See the module
@@ -142,6 +146,72 @@ expression subset (arithmetic/bitwise/shift, comparisons, logical ops,
 `in`/`range`) and tracks cumulative `attempts`/`hits` counters; evaluating an unsupported node
 (`dist` or the structural constraints) panics for now.
 
+## The SMT sampler
+
+`crv.SmtSampler` is the engine for what rejection sampling cannot reach: sparse
+solution spaces (`x == 42` on a 32-bit variable is one draw in four billion) and
+wide datapath arithmetic. It is meant to be *dispatched to* for hard constraint
+sets, not tried first.
+
+Bitwuzla runs as a **compiler, not an interpreter**. A solver call per
+`randomize()` would be orders of magnitude too slow for a simulation loop, and
+badly distributed besides — solvers answer from whatever corner their heuristics
+reach first, and re-seeding does not fix that. So `init` does the expensive work
+once and `next` draws from the result:
+
+1. **Encode** the IR into Bitwuzla terms.
+2. **Shrink** to an independent support — the bits that actually have to be
+   reasoned about — structurally from `Analysis`, then by Padoa definability
+   queries.
+3. **Count** with ApproxMC. Its zero-hash step is exhaustive enumeration, so a
+   small solution set comes back already listed and exactly counted.
+4. **Sample** by enumerating one random hash cell per batch.
+
+Uniformity comes from the hash family's pairwise independence, not from the
+solver's behaviour, which is why solver bias never enters the picture.
+`guarantee()` reports what the stream is actually distributed like — `.exact`,
+`.almost_uniform`, or `.biased` — and is fixed once `init` returns. The biased
+fallback is off by default: an instance that defeats the pipeline fails `init`
+rather than quietly returning samples nobody asked for.
+
+```zig
+var s = try crv.SmtSampler.init(gpa, &ir, .{ .seed = 0 }); // the expensive part
+defer s.deinit(gpa);
+switch (s.guarantee()) { .exact => {}, else => {} }
+_ = s.solver().next(out);                                   // a draw
+```
+
+The backend is **opt-in**, so the default build has no external dependencies:
+
+```sh
+zig build -Dbitwuzla -Dbitwuzla-include=/usr/local/include -Dbitwuzla-lib=/usr/local/lib
+```
+
+Without it `SmtSampler.init` returns `error.BackendUnavailable` and everything
+else works unchanged. `libbitwuzla` should be built with CryptoMiniSat, which
+`Options.sat_solver` selects by default — it recovers XOR structure from CNF and
+can run Gauss-Jordan over it, which is what makes parity constraints affordable.
+
+`dist`, `solve_before`, and `foreach` are rejected with `error.Unsupported`
+rather than ignored, since each changes the distribution a sampler should
+produce.
+
+## Static analysis
+
+`crv.Analysis` is solver-independent, and any engine can use it:
+
+- **Demanded bits** — per variable, the mask of bits some constraint can
+  observe. `x & 0xff == 0x42` on a 32-bit `x` leaves 24 bits free, so a decision
+  procedure sees 8 bits instead of 32 and the rest are drawn straight from the
+  RNG. Since the solution set factors as (demanded assignments) × (free bits),
+  drawing them independently is exactly uniform — but only if they are redrawn
+  per sample rather than read back from one solver model.
+- **Defined variables** — those pinned by a top-level `v == expr`, accepted only
+  once everything they depend on is, which admits chains and rejects cycles.
+
+Both are sound under-approximations: never a free bit that is observable, never
+a pinned variable that is not.
+
 ## Layout
 
 ```
@@ -150,7 +220,13 @@ build.zig.zon            # package manifest (name, version, dependencies)
 src/root.zig             # library root — the public API
 src/Ir.zig               # the flattened-tree IR
 src/Solver.zig           # the swappable solver interface
+src/Analysis.zig         # demanded-bit and definition analyses
 src/RejectionSampler.zig # the rejection-sampling engine
+src/SmtSampler.zig       # the SMT-backed almost-uniform sampler
+src/smt/Encoder.zig      # Ir -> Bitwuzla terms
+src/smt/Support.zig      # independent support minimization
+src/smt/Hashing.zig      # XOR hashing, ApproxMC, cell enumeration
+src/bitwuzla/            # backend binding: enabled.zig / disabled.zig
 ```
 
 ## License

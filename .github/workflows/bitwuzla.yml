@@ -1,0 +1,48 @@
+name: SMT backend
+
+# Not part of the pull-request gate. Building Bitwuzla (plus GMP, MPFR,
+# CaDiCaL, SymFPU, and CryptoMiniSat) takes long enough that it does not belong
+# on every push, and the default build of libcrv deliberately has no external
+# dependencies at all. Run this by hand to exercise `crv.SmtSampler`, whose
+# tests skip themselves when the backend is absent.
+on:
+  workflow_dispatch:
+
+jobs:
+  smt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build pkg-config cmake \
+            libgmp-dev libmpfr-dev libcryptominisat5-dev
+
+      # SmtSampler defaults to CryptoMiniSat, so the library has to be built
+      # with it; Bitwuzla fetches CaDiCaL and SymFPU itself when they are not
+      # already installed.
+      - name: Build Bitwuzla
+        run: |
+          git clone --depth 1 https://github.com/bitwuzla/bitwuzla.git
+          cd bitwuzla
+          ./configure.py --prefix "$HOME/bitwuzla-install" --shared --cms
+          cd build
+          ninja
+          ninja install
+
+      - name: Test with the backend linked
+        run: |
+          zig build test \
+            -Dbitwuzla \
+            -Dbitwuzla-include="$HOME/bitwuzla-install/include" \
+            -Dbitwuzla-lib="$HOME/bitwuzla-install/lib"
+        env:
+          LD_LIBRARY_PATH: ${{ env.HOME }}/bitwuzla-install/lib
