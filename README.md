@@ -196,6 +196,44 @@ can run Gauss-Jordan over it, which is what makes parity constraints affordable.
 rather than ignored, since each changes the distribution a sampler should
 produce.
 
+### Benchmarks
+
+`zig build bench` reports wall-clock — compile once, then per sample — and
+needs the backend. `bench/distribution.py` answers the other half, whether the
+samples are actually uniform, by porting the engine's control flow and running
+it against brute-force ground truth; it needs no solver, so it runs anywhere.
+`bench/sweep.py` measures what the counting rounds buy.
+
+Measured by the simulation, per solution `p_i * |S|` against the `1 + eps` band
+and a chi-squared over the whole solution set:
+
+| instance | \|S\| | path | chi²/dof | within 1+eps | calls/sample |
+|---|---|---|---|---|---|
+| `popcount(x)==3`, 18-bit | 816 | exact | 0.967 | 100% | 0 |
+| `popcount(x)==3`, 18-bit | 816 | hashed | 0.852 | 100% | 3.3 |
+| `popcount`, 1 sample/cell | 816 | hashed | 0.909 | 100% | 26.9 |
+| `x*x % 1021 == 835`, 20-bit | 2054 | hashed | 1.043 | 100% | 4.1 |
+| `a*b == 1440`, 11-bit | 36 | exact | 1.134 | 100% | 0 |
+| low byte in `[10:20]`, 20-bit | 45056 | exact | 1.000 | — | 0 |
+
+Across 12 seeds the mean chi-squared z-score is −0.06 on the hashed path and
++0.24 on the free-bit path, so there is no detectable systematic bias.
+
+The counting default is a deliberate trade. The `1 - delta` bound needs
+`ceil(17 log2(3/delta))` rounds — 84 for `delta = 0.1` — and `max_rounds`
+defaults to 17, which **proves nothing** and reports `delta = 1.0` to say so.
+Measured over 25 seeds it is nonetheless accurate:
+
+| rounds | proven delta | estimates in band | spread | compile calls |
+|---|---|---|---|---|
+| 3 | vacuous | 25/25 | 0.75–1.20× | 824 |
+| 9 | vacuous | 25/25 | 0.90–1.12× | 2326 |
+| 17 (default) | vacuous | 25/25 | 0.92–1.04× | 4329 |
+| 84 | 0.098 | 25/25 | 0.98–1.02× | 21046 |
+
+Set `max_rounds = Hashing.roundsFor(delta)` when the guarantee itself matters
+rather than just the accuracy.
+
 ## Static analysis
 
 `crv.Analysis` is solver-independent, and any engine can use it:

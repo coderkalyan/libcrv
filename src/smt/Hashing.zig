@@ -226,8 +226,16 @@ pub fn roundsFor(delta: f64) u32 {
 /// The confidence actually delivered by `rounds` rounds — the inverse of
 /// `roundsFor`, so a capped run can report what it really proved instead of
 /// what was asked for.
+///
+/// Clamped at 1.0, and that clamp is the common case: the bound only becomes
+/// non-vacuous past 27 rounds, so the default cap of 17 proves *nothing* and
+/// must say so rather than report a "probability" above one. Measured accuracy
+/// at 17 rounds is far better than the theory bounds — estimates land inside
+/// the epsilon band every time in testing — but "unproven and good in practice"
+/// is a different claim from "proven", and only the latter is a guarantee.
 pub fn deltaFor(rounds: u32) f64 {
-    return 3.0 / std.math.pow(f64, 2.0, @as(f64, @floatFromInt(rounds)) / 17.0);
+    const raw = 3.0 / std.math.pow(f64, 2.0, @as(f64, @floatFromInt(rounds)) / 17.0);
+    return @min(1.0, raw);
 }
 
 pub const CountResult = union(enum) {

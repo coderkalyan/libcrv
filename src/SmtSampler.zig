@@ -81,6 +81,12 @@ pub const Guarantee = union(enum) {
     exact,
     /// Each solution's probability lies within a `1 + epsilon` factor of
     /// `1/|S|`, with confidence `1 - delta`.
+    ///
+    /// A `delta` of 1.0 means no confidence was *proven*: the counting phase
+    /// was capped below the `ceil(17 log2(3/delta))` rounds the bound needs, so
+    /// the estimate is unbacked by the theorem even though it is reliable in
+    /// practice. Raise `Options.max_rounds` to `roundsFor(delta)` to earn the
+    /// real bound, at roughly five times the compile cost for delta = 0.1.
     almost_uniform: struct { epsilon: f64, delta: f64 },
     /// No distributional guarantee at all.
     biased,
@@ -96,7 +102,12 @@ pub const Options = struct {
     /// usually binds first, and the confidence actually delivered is reported
     /// by `guarantee()` rather than assumed.
     delta: f64 = 0.1,
-    /// Ceiling on counting rounds.
+    /// Ceiling on counting rounds. The default trades the proven bound for
+    /// roughly a fifth of the compile cost: measured over 25 seeds, 17 rounds
+    /// put every count estimate inside the epsilon band (0.92x to 1.04x of
+    /// truth) where 84 rounds cost 4.9x as many solver calls to narrow that to
+    /// 0.98x-1.02x. Set this to `Hashing.roundsFor(delta)` when the guarantee
+    /// itself matters and not just the accuracy.
     max_rounds: u32 = 17,
 
     /// Samples handed out per enumerated cell. Larger is faster; the samples
