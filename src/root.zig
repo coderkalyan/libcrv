@@ -20,6 +20,11 @@ pub const Analysis = @import("Analysis.zig");
 /// first assignment that satisfies every constraint.
 pub const RejectionSampler = @import("RejectionSampler.zig");
 
+/// An SMT-backed almost-uniform sampler for the constraint sets cheaper engines
+/// cannot handle. Requires building with `-Dbitwuzla`; without it, `init`
+/// returns `error.BackendUnavailable`.
+pub const SmtSampler = @import("SmtSampler.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
