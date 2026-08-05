@@ -138,6 +138,12 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Error!BddSolver {
     var partition = try Partition.init(gpa, ir);
     defer partition.deinit(gpa);
 
+    // Which variables serve only as shift amounts, so `order` can hoist them
+    // above the value bits. Depends only on how a variable is used, so it is
+    // computed once and shared across components.
+    const amount_only = try Order.shiftAmountOnly(gpa, ir);
+    defer gpa.free(amount_only);
+
     // Variable index -> slot within its component, rebuilt per component.
     const slot_of_var = try gpa.alloc(u32, ir.vars.len);
     defer gpa.free(slot_of_var);
@@ -161,7 +167,7 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Error!BddSolver {
     };
 
     for (partition.components) |component| {
-        var ord = try Order.init(gpa, ir, component.vars, options.max_levels);
+        var ord = try Order.init(gpa, ir, component.vars, amount_only, options.max_levels);
         defer ord.deinit(gpa);
 
         for (component.vars, 0..) |v, slot| slot_of_var[@intFromEnum(v)] = @intCast(slot);
@@ -522,6 +528,40 @@ test "a wide variable-by-variable multiply is refused, a narrow one is not" {
         try constrain(gpa, &ir, try ir.binary(gpa, .eq, product, try ir.constInt(gpa, 12, Type.bit(32))));
 
         try testing.expectError(error.OperandTooWide, BddSolver.init(gpa, &ir, .{}));
+    }
+}
+
+test "a variable shift of a wide operand stays tractable" {
+    const gpa = testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // `x << s == 256` over a 32-bit x. The shift amount is a selector, so it
+    // has to be ordered above the operand — left at the bottom, where
+    // significance alignment would otherwise put its five bits, this exhausts
+    // the node budget instead of building.
+    const ty = Type.bit(32);
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = ty, .kind = .rand });
+    const s = try ir.addVariable(gpa, .{
+        .id = @enumFromInt(1),
+        .ty = Type.bit(Ir.shiftAmountWidth(32)),
+        .kind = .rand,
+    });
+    const shifted = try ir.binary(gpa, .sll, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    try constrain(gpa, &ir, try ir.binary(gpa, .eq, shifted, try ir.constInt(gpa, 256, ty)));
+
+    var solver_state = try BddSolver.init(gpa, &ir, .{ .seed = 31 });
+    defer solver_state.deinit(gpa);
+
+    // For each shift of k <= 8, x is pinned in its low bits and free in the k
+    // bits shifted out: 2^0 + 2^1 + ... + 2^8 = 511 solutions.
+    try testing.expectApproxEqAbs(@log2(511.0), solver_state.log2Count(), 1e-9);
+
+    var out: [2]Value = undefined;
+    for (0..500) |_| {
+        try testing.expect(solver_state.next(&out));
+        const shifted_value = (out[0] << @intCast(out[1])) & 0xffff_ffff;
+        try testing.expectEqual(@as(Value, 256), shifted_value);
     }
 }
 

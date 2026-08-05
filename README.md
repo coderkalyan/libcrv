@@ -181,6 +181,7 @@ draw in 67 million and gives up:
 | `x + y == z`, three 32-bit variables | 0.5 ms | 620 ns |
 | `x % 64 == 0`, 32-bit (power of two → wiring) | 0.5 ms | 50 ns |
 | `x % 100 == 7`, 32-bit (restoring division array) | 18 ms | 190 ns |
+| `x << s == 256`, 32-bit variable shift | 0.5 ms | 190 ns |
 | 64 independent 32-bit range constraints | 3 ms | 10.3 µs |
 
 Four decisions carry that performance:
@@ -189,7 +190,10 @@ Four decisions carry that performance:
    most-significant-first, interleaving the bits of variables that interact.
    `x + y == z` is linear under this order and *exponential* if each variable's
    bits are kept contiguous. This is not a tuning knob; without it the engine
-   does not work.
+   does not work. One exception rides above it: a variable used only as a shift
+   amount is hoisted ahead of the value bits, because an amount is a selector
+   rather than a datum — deciding it first collapses each branch to a fixed
+   wiring of the operand.
 2. **Partitioning** (`src/Partition.zig`) splits the constraints into
    independent components and solves each separately. Sampling them
    independently is exact — independence is what a component boundary means —

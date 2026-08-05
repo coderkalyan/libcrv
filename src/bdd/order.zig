@@ -36,6 +36,17 @@
 //!     would misalign every carry and comparison between them; pairing equal
 //!     *significance* keeps arithmetic between different widths linear.
 //!
+//! One exception rides above all of that: a variable used *only* as a shift
+//! amount is placed before every value bit. An amount is a selector, not a
+//! datum — deciding it first collapses each branch to a fixed wiring of the
+//! operand, whereas leaving it below forces the diagram to remember the entire
+//! operand before it learns how far to shift. Significance alignment would
+//! otherwise bury it: an amount is `ceil(log2(w))` bits against a `w`-bit
+//! operand, so its bits are all low-significance and land at the very bottom.
+//! The rule is deliberately narrow — a variable used anywhere else keeps its
+//! normal place, so it cannot pull a variable out of an interleaving that some
+//! other constraint depends on.
+//!
 //! The order is static — chosen once, before anything is built. Dynamic
 //! reordering (sifting) is the standard escape hatch when a static heuristic
 //! misses, and the interface here does not preclude adding it later.
@@ -69,20 +80,103 @@ pub const Error = error{
     TooManyBits,
 } || Allocator.Error;
 
+/// Classify every variable in `ir` as "referenced only as a shift amount".
+///
+/// One reverse sweep, the same shape as the reachability marking elsewhere:
+/// each node hands its context down to its children, except that a shift routes
+/// its right operand into the amount context no matter what context it is in
+/// itself. A variable then qualifies when every live reference to it arrived
+/// through that route.
+///
+/// Computed once per IR and shared across components, since it depends only on
+/// how a variable is used, not on which component it lands in. Caller owns the
+/// returned slice, indexed by `Ir.Variable.Index`.
+pub fn shiftAmountOnly(gpa: Allocator, ir: *const Ir) Allocator.Error![]bool {
+    const n = ir.nodes.len;
+
+    const as_amount = try gpa.alloc(bool, n);
+    defer gpa.free(as_amount);
+    const as_value = try gpa.alloc(bool, n);
+    defer gpa.free(as_value);
+    @memset(as_amount, false);
+    @memset(as_value, false);
+
+    for (ir.constraints.items(.body)) |body| {
+        for (ir.extra.items[@intFromEnum(body.start)..][0..body.len]) |raw| as_value[raw] = true;
+    }
+
+    const tags = ir.nodes.items(.tag);
+    const datas = ir.nodes.items(.data);
+
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        if (!as_amount[i] and !as_value[i]) continue;
+        var ctx: Propagate = .{
+            .as_amount = as_amount,
+            .as_value = as_value,
+            .from_amount = as_amount[i],
+            .from_value = as_value[i],
+        };
+        switch (tags[i]) {
+            .sll, .srl, .sra => {
+                const d = datas[i];
+                ctx.visit(.{ .node = @enumFromInt(d.lhs) });
+                as_amount[d.rhs] = true;
+            },
+            else => ir.forEachChild(@enumFromInt(@as(u32, @intCast(i))), &ctx, Propagate.visit),
+        }
+    }
+
+    const only = try gpa.alloc(bool, ir.vars.len);
+    errdefer gpa.free(only);
+    @memset(only, false);
+
+    const used_as_value = try gpa.alloc(bool, ir.vars.len);
+    defer gpa.free(used_as_value);
+    @memset(used_as_value, false);
+
+    for (tags, datas, 0..) |tag, d, k| {
+        if (tag != .var_ref) continue;
+        if (as_amount[k]) only[d.lhs] = true;
+        if (as_value[k]) used_as_value[d.lhs] = true;
+    }
+    for (only, used_as_value) |*flag, mixed| flag.* = flag.* and !mixed;
+    return only;
+}
+
+/// Hands one node's context down to its operand nodes.
+const Propagate = struct {
+    as_amount: []bool,
+    as_value: []bool,
+    from_amount: bool,
+    from_value: bool,
+
+    fn visit(p: *Propagate, child: Ir.Child) void {
+        switch (child) {
+            .node => |index| {
+                const j = @intFromEnum(index);
+                p.as_amount[j] = p.as_amount[j] or p.from_amount;
+                p.as_value[j] = p.as_value[j] or p.from_value;
+            },
+            .variable => {},
+        }
+    }
+};
+
 /// Assign levels to the bits of `vars`, in the order they are given.
+///
+/// `amount_only` comes from `shiftAmountOnly` and is indexed by
+/// `Ir.Variable.Index`; an empty slice means no variable qualifies.
 pub fn init(
     gpa: Allocator,
     ir: *const Ir,
     vars: []const Ir.Variable.Index,
+    amount_only: []const bool,
     max_levels: u32,
 ) Error!Order {
     var total: u64 = 0;
-    var widest: u16 = 0;
-    for (vars) |v| {
-        const w = widthOf(ir, v);
-        total += w;
-        widest = @max(widest, w);
-    }
+    for (vars) |v| total += widthOf(ir, v);
     if (total > max_levels) return error.TooManyBits;
 
     var self: Order = .{
@@ -100,21 +194,31 @@ pub fn init(
     self.slot_start[0] = 0;
     for (vars, 0..) |v, slot| self.slot_start[slot + 1] = self.slot_start[slot] + widthOf(ir, v);
 
-    // Walk significance from most to least; at each step every variable wide
-    // enough to reach that significance contributes its bit, in slot order.
+    // Shift-amount-only variables form a leading group; everything else
+    // follows. Within each group the significance interleaving is identical, so
+    // a constraint set with no shifts gets exactly the order it would have had.
     var next: u32 = 0;
-    var significance: u16 = widest;
-    while (significance > 0) {
-        significance -= 1;
-        for (vars, 0..) |v, slot| {
-            // A bit's significance *is* its position: bit `k` carries weight
-            // 2^k whatever the variable's width. Aligning on the position (and
-            // not on distance from the top) is what keeps arithmetic between
-            // differently sized variables linear.
-            if (widthOf(ir, v) <= significance) continue;
-            self.bits[next] = .{ .slot = @intCast(slot), .bit = significance };
-            self.level_of[self.slot_start[slot] + significance] = next;
-            next += 1;
+    for ([_]bool{ true, false }) |amounts_pass| {
+        var widest: u16 = 0;
+        for (vars) |v| {
+            if (isAmountOnly(amount_only, v) != amounts_pass) continue;
+            widest = @max(widest, widthOf(ir, v));
+        }
+
+        var significance: u16 = widest;
+        while (significance > 0) {
+            significance -= 1;
+            for (vars, 0..) |v, slot| {
+                if (isAmountOnly(amount_only, v) != amounts_pass) continue;
+                // A bit's significance *is* its position: bit `k` carries
+                // weight 2^k whatever the variable's width. Aligning on the
+                // position (and not on distance from the top) is what keeps
+                // arithmetic between differently sized variables linear.
+                if (widthOf(ir, v) <= significance) continue;
+                self.bits[next] = .{ .slot = @intCast(slot), .bit = significance };
+                self.level_of[self.slot_start[slot] + significance] = next;
+                next += 1;
+            }
         }
     }
     std.debug.assert(next == self.levels);
@@ -132,6 +236,11 @@ pub fn deinit(self: *Order, gpa: Allocator) void {
 /// The level deciding bit `bit` of the variable in `slot`.
 pub fn level(self: *const Order, slot: u32, bit: u16) u32 {
     return self.level_of[self.slot_start[slot] + bit];
+}
+
+fn isAmountOnly(amount_only: []const bool, v: Ir.Variable.Index) bool {
+    const i = @intFromEnum(v);
+    return i < amount_only.len and amount_only[i];
 }
 
 /// A variable's width, resolving the "unspecified" encoding.
@@ -152,7 +261,7 @@ test "equal widths interleave, most significant first" {
     const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(3), .kind = .rand });
     const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(3), .kind = .rand });
 
-    var ord = try Order.init(gpa, &ir, &.{ x, y }, 64);
+    var ord = try Order.init(gpa, &ir, &.{ x, y }, &.{}, 64);
     defer ord.deinit(gpa);
 
     try std.testing.expectEqual(@as(u32, 6), ord.levels);
@@ -177,7 +286,7 @@ test "mixed widths align by significance, not by bit index" {
     const narrow = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(2), .kind = .rand });
     const wide = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(4), .kind = .rand });
 
-    var ord = try Order.init(gpa, &ir, &.{ narrow, wide }, 64);
+    var ord = try Order.init(gpa, &ir, &.{ narrow, wide }, &.{}, 64);
     defer ord.deinit(gpa);
 
     try std.testing.expectEqual(@as(u32, 6), ord.levels);
@@ -199,13 +308,77 @@ test "mixed widths align by significance, not by bit index" {
     try std.testing.expectEqual(ord.level(0, 1) + 1, ord.level(1, 1));
 }
 
+test "a variable used only as a shift amount leads the order" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // x << s == 4, with s sized as the IR requires of an amount.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const s = try ir.addVariable(gpa, .{
+        .id = @enumFromInt(1),
+        .ty = Type.bit(Ir.shiftAmountWidth(4)),
+        .kind = .rand,
+    });
+    const shifted = try ir.binary(gpa, .sll, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    _ = try ir.addConstraint(gpa, @enumFromInt(0), .{}, &.{
+        try ir.binary(gpa, .eq, shifted, try ir.constInt(gpa, 4, Type.bit(4))),
+    });
+
+    const amount_only = try Order.shiftAmountOnly(gpa, &ir);
+    defer gpa.free(amount_only);
+    try std.testing.expect(!amount_only[0]); // x is a value
+    try std.testing.expect(amount_only[1]); // s is only ever an amount
+
+    var ord = try Order.init(gpa, &ir, &.{ x, s }, amount_only, 64);
+    defer ord.deinit(gpa);
+
+    // Both of s's bits come first; x's four follow, still most significant
+    // first. Without this the amount would sit at the bottom, since its bits
+    // are all low-significance.
+    const expected = [_]Order.Bit{
+        .{ .slot = 1, .bit = 1 },
+        .{ .slot = 1, .bit = 0 },
+        .{ .slot = 0, .bit = 3 },
+        .{ .slot = 0, .bit = 2 },
+        .{ .slot = 0, .bit = 1 },
+        .{ .slot = 0, .bit = 0 },
+    };
+    try std.testing.expectEqualSlices(Order.Bit, &expected, ord.bits);
+}
+
+test "a variable used as a value as well keeps its normal place" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // s is a shift amount in one statement and a plain value in another, so
+    // hoisting it could break an interleaving the second one depends on.
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    const s = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(2), .kind = .rand });
+    const shifted = try ir.binary(gpa, .sll, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    _ = try ir.addConstraint(gpa, @enumFromInt(0), .{}, &.{
+        try ir.binary(gpa, .eq, shifted, try ir.constInt(gpa, 4, Type.bit(4))),
+        try ir.binary(gpa, .ugt, try ir.varRef(gpa, s), try ir.constInt(gpa, 0, Type.bit(2))),
+    });
+
+    const amount_only = try Order.shiftAmountOnly(gpa, &ir);
+    defer gpa.free(amount_only);
+    try std.testing.expect(!amount_only[1]);
+
+    // So the order is the plain significance interleaving.
+    var ord = try Order.init(gpa, &ir, &.{ x, s }, amount_only, 64);
+    defer ord.deinit(gpa);
+    try std.testing.expectEqual(Order.Bit{ .slot = 0, .bit = 3 }, ord.bits[0]);
+}
+
 test "an oversized component is rejected up front" {
     const gpa = std.testing.allocator;
     var ir: Ir = .{};
     defer ir.deinit(gpa);
 
     const v = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(64), .kind = .rand });
-    try std.testing.expectError(error.TooManyBits, Order.init(gpa, &ir, &.{v}, 32));
+    try std.testing.expectError(error.TooManyBits, Order.init(gpa, &ir, &.{v}, &.{}, 32));
 }
 
 test "a variable-free component has no levels" {
@@ -213,7 +386,7 @@ test "a variable-free component has no levels" {
     var ir: Ir = .{};
     defer ir.deinit(gpa);
 
-    var ord = try Order.init(gpa, &ir, &.{}, 64);
+    var ord = try Order.init(gpa, &ir, &.{}, &.{}, 64);
     defer ord.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 0), ord.levels);
 }
