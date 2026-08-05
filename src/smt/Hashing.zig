@@ -341,6 +341,17 @@ fn logSatSearch(
     return .{ .m = lo, .cell = final.found };
 }
 
+/// Solutions to aim for in each cell.
+///
+/// Big enough that an empty cell — which costs a retry — is rare, and small
+/// enough to stay well inside the pivot the concentration bound is stated for.
+/// This is also the natural batch size: enumerating a cell costs one solver
+/// call per member plus a final unsat, so consuming fewer members than this
+/// throws away calls already paid for.
+pub fn cellTarget(pivot: u32) u32 {
+    return @max(pivot / 2, 1);
+}
+
 /// The hash width to aim at so that a cell holds roughly `target` solutions.
 pub fn aimFor(c: Count, target: u32) u16 {
     const total = c.log2Floor() orelse return 0;

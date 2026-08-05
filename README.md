@@ -210,14 +210,36 @@ and a chi-squared over the whole solution set:
 | instance | \|S\| | path | chi²/dof | within 1+eps | calls/sample |
 |---|---|---|---|---|---|
 | `popcount(x)==3`, 18-bit | 816 | exact | 0.967 | 100% | 0 |
-| `popcount(x)==3`, 18-bit | 816 | hashed | 0.852 | 100% | 3.3 |
-| `popcount`, 1 sample/cell | 816 | hashed | 0.909 | 100% | 26.9 |
-| `x*x % 1021 == 835`, 20-bit | 2054 | hashed | 1.043 | 100% | 4.1 |
+| `popcount(x)==3`, 18-bit | 816 | hashed | 0.990 | 100% | 1.1 |
+| `x*x % 1021 == 835`, 20-bit | 2054 | hashed | 1.039 | 100% | 1.1 |
 | `a*b == 1440`, 11-bit | 36 | exact | 1.134 | 100% | 0 |
 | low byte in `[10:20]`, 20-bit | 45056 | exact | 1.000 | — | 0 |
 
 Across 12 seeds the mean chi-squared z-score is −0.06 on the hashed path and
 +0.24 on the free-bit path, so there is no detectable systematic bias.
+
+A drawn sample costs **no** solver calls — it is a batch pop. The cost is the
+refill, which enumerates one hash cell, and enumerating `k` models takes `k + 1`
+calls: one per model (find it, block it, ask again) plus the final unsat that
+proves the cell is complete. Completeness is the point — picking uniformly from
+a cell means knowing all of it, and taking whichever models the solver offered
+first would hand back exactly the bias the hashing removes.
+
+So per-sample cost is `(cell size + 1) / samples taken`, and the two should
+match. Measured on the 816-solution instance, cells of ~26:
+
+| samples/cell | calls/sample | chi²/dof | distinct per window of 8 |
+|---|---|---|---|
+| 1 (independent) | 26.8 | 1.022 | 7.9668 |
+| 8 | 3.3 | 0.983 | 7.9878 |
+| 36 (whole cell, default) | 1.05 | 0.974 | 7.9961 |
+
+Marginal uniformity is flat across all three. What varies is independence
+*between consecutive* samples: a cell is sampled without replacement, so batched
+draws repeat less often than truly independent ones (iid averages 7.9657
+distinct per window of 8). The default consumes the whole cell, since the calls
+are already spent; `samples_per_cell = 1` buys strict independence at ~25× the
+solver calls.
 
 The counting default is a deliberate trade. The `1 - delta` bound needs
 `ceil(17 log2(3/delta))` rounds — 84 for `delta = 0.1` — and `max_rounds`

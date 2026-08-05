@@ -110,11 +110,21 @@ pub const Options = struct {
     /// itself matters and not just the accuracy.
     max_rounds: u32 = 17,
 
-    /// Samples handed out per enumerated cell. Larger is faster; the samples
-    /// within one batch come from a single cell without replacement, so they
-    /// are negatively correlated with each other even though each remains
-    /// individually almost-uniform. Set to 1 for fully independent draws.
-    samples_per_cell: u32 = 8,
+    /// Samples handed out per enumerated cell, or null to consume the whole
+    /// cell (`Hashing.cellTarget`).
+    ///
+    /// Enumerating a cell costs one solver call per member plus a final unsat,
+    /// so anything less than the cell's size discards calls already paid for:
+    /// measured on an 816-solution instance with cells of ~26, taking 8 costs
+    /// 3.33 calls per sample where taking the lot costs 1.05.
+    ///
+    /// What it buys is independence. Samples from one cell are drawn without
+    /// replacement, so consecutive draws repeat less often than truly
+    /// independent ones would — measurably, though barely: in windows of 8, iid
+    /// draws average 7.9657 distinct and full-cell batches average 7.9961. The
+    /// marginal distribution is unaffected either way. Set this to 1 for fully
+    /// independent draws at roughly 25x the solver calls.
+    samples_per_cell: ?u32 = null,
 
     /// Per-bit inclusion probability in each parity constraint. One half gives
     /// the 2-universal family the guarantees are stated for; lower values make
@@ -178,6 +188,8 @@ batch_capacity: usize,
 
 /// Parity constraints per cell, once the count has aimed it.
 hash_width: u16,
+/// Samples taken from each enumerated cell, resolved from `Options`.
+batch_take: u32,
 /// Set when `batch` holds the entire solution set and never needs refilling.
 enumerated: bool,
 
@@ -250,6 +262,7 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Error!SmtSampler {
         .batch_pos = 0,
         .batch_capacity = capacity,
         .hash_width = 0,
+        .batch_take = options.samples_per_cell orelse Hashing.cellTarget(pivot),
         .enumerated = false,
     };
 
@@ -303,7 +316,7 @@ fn measure(self: *SmtSampler, gpa: Allocator) Error!void {
         },
 
         .approx => |c| {
-            self.hash_width = Hashing.aimFor(c, @max(pivot / 2, 1));
+            self.hash_width = Hashing.aimFor(c, Hashing.cellTarget(pivot));
             self.guarantee_ = .{ .almost_uniform = .{
                 .epsilon = self.options.epsilon,
                 // Report the confidence the rounds actually bought, not the
@@ -437,7 +450,7 @@ fn refill(self: *SmtSampler) bool {
         // Shuffle so the prefix handed out is a uniform subset of the cell
         // rather than whatever order the solver enumerated in.
         self.shuffleBatch(rand, cell.found);
-        self.batch_len = @min(cell.found, @max(self.options.samples_per_cell, 1));
+        self.batch_len = @min(cell.found, @max(self.batch_take, 1));
         self.batch_pos = 0;
         return true;
     }

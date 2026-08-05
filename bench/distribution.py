@@ -92,13 +92,14 @@ class Sampler:
     """Port of SmtSampler: measure() then next()."""
 
     def __init__(self, oracle, free_bits=0, seed=0, epsilon=0.8, delta=0.1,
-                 max_rounds=17, samples_per_cell=8, exact_limit=4096,
+                 max_rounds=17, samples_per_cell=None, exact_limit=4096,
                  xor_density=0.5, cell_retries=16):
         self.o = oracle
         self.free_bits = free_bits
         self.rng = random.Random(seed)
         self.epsilon = epsilon
-        self.samples_per_cell = samples_per_cell
+        self.samples_per_cell = (samples_per_cell if samples_per_cell is not None
+                                 else max(pivot_for(epsilon) // 2, 1))
         self.xor_density = xor_density
         self.cell_retries = cell_retries
         self.pivot = pivot_for(epsilon)
