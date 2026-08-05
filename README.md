@@ -222,10 +222,14 @@ otherwise catch: indices are bounds-checked, operand widths must agree
 (`CRV_ERR_WIDTH_MISMATCH`; change width with `crv_node_cast`), deserialized
 blobs are validated, and a solver refuses an IR containing a node it cannot
 evaluate. What it deliberately does not do is defend a C caller from hazards a
-Zig caller also has: a solver borrows its IR, and appending to that IR while the
-solver lives is undefined for both. No buffer crosses the boundary for the
-caller to free: where the library produces bytes, the caller supplies the
-storage.
+Zig caller also has. A solver borrows its IR, and appending to that IR while the
+solver lives is undefined for both. A `crv_ir *` or `crv_solver *` is
+dereferenced unchecked, so passing NULL is undefined too — a `*Ir` cannot be
+null in Zig, and a status that conflated "you passed NULL" with a real answer
+would be worse than the segfault. (`crv_solver_free(NULL)` is the exception, so
+that cleaning up after a failed constructor needs no guard, exactly as with
+`free`.) No buffer crosses the boundary for the caller to free: where the
+library produces bytes, the caller supplies the storage.
 
 Solutions come back in the same layout Zig sees — little-endian 64-bit words,
 `crv_value_words(&ir)` per variable — so there is no marshalling in either

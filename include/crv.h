@@ -81,8 +81,8 @@ typedef enum crv_status {
     CRV_EXHAUSTED = 1,
 
     CRV_ERR_OOM = -1,
-    /* A null handle, an out-of-range index, an unknown enum value, or a
-     * count/pointer pair that does not describe a valid array. */
+    /* An out-of-range index, an unknown enum value, or a count/pointer pair
+     * that does not describe a valid array. */
     CRV_ERR_INVALID_ARGUMENT = -2,
     /* Operand widths disagree where the evaluator needs one width. Change
      * width only through `crv_node_cast`. */
@@ -126,7 +126,12 @@ typedef uint32_t crv_constraint;
 
 #define CRV_INVALID UINT32_MAX
 
-/* Every out-parameter below may be NULL to discard the result. */
+/* An out-parameter below may be NULL to discard the result, except where the
+ * result is the whole point of the call (`crv_ir_deserialize`,
+ * `crv_rejection_sampler_new`). A `crv_ir *` or `crv_solver *`, by contrast, is
+ * dereferenced unchecked: passing NULL is undefined, as it is for most of the C
+ * standard library. `crv_solver_free(NULL)` is the one exception, so that
+ * cleaning up after a failed constructor needs no guard. */
 
 /* -- IR lifetime ---------------------------------------------------------- */
 

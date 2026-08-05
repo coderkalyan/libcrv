@@ -201,32 +201,27 @@ fn tagIn(raw: c_int, class: Ir.Node.Tag.Class) ?Ir.Node.Tag {
 
 // -- IR lifetime -------------------------------------------------------------
 
-export fn crv_ir_init(handle: ?*Ir) void {
-    const ir = handle orelse return;
+export fn crv_ir_init(ir: *Ir) void {
     ir.* = .{};
 }
 
-export fn crv_ir_deinit(handle: ?*Ir) void {
-    const ir = handle orelse return;
+export fn crv_ir_deinit(ir: *Ir) void {
     ir.deinit(gpa);
 }
 
-export fn crv_ir_reserve(handle: ?*Ir, nodes: u32, vars: u32, extra: u32) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_ir_reserve(ir: *Ir, nodes: u32, vars: u32, extra: u32) Status {
     ir.nodes.ensureTotalCapacity(gpa, nodes) catch return .err_oom;
     ir.vars.ensureTotalCapacity(gpa, vars) catch return .err_oom;
     ir.extra.ensureTotalCapacity(gpa, extra) catch return .err_oom;
     return .ok;
 }
 
-export fn crv_ir_validate(handle: ?*const Ir) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_ir_validate(ir: *const Ir) Status {
     ir.validate(gpa) catch |err| return statusOf(err);
     return .ok;
 }
 
-export fn crv_ir_node_count(handle: ?*const Ir) u32 {
-    const ir = handle orelse return 0;
+export fn crv_ir_node_count(ir: *const Ir) u32 {
     return @intCast(ir.nodes.len);
 }
 
@@ -239,9 +234,8 @@ const VarInfo = extern struct {
     reserved: u8,
 };
 
-export fn crv_var_add(handle: ?*Ir, id: u32, width: u16, kind: c_int, out: ?*u32) Status {
+export fn crv_var_add(ir: *Ir, id: u32, width: u16, kind: c_int, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     if (width == 0) return .err_invalid_argument;
     const k = std.enums.fromInt(Ir.Variable.Kind, kind) orelse return .err_invalid_argument;
 
@@ -255,13 +249,11 @@ export fn crv_var_add(handle: ?*Ir, id: u32, width: u16, kind: c_int, out: ?*u32
     return .ok;
 }
 
-export fn crv_var_count(handle: ?*const Ir) u32 {
-    const ir = handle orelse return 0;
+export fn crv_var_count(ir: *const Ir) u32 {
     return @intCast(ir.vars.len);
 }
 
-export fn crv_var_get(handle: ?*const Ir, v: u32, out: ?*VarInfo) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_var_get(ir: *const Ir, v: u32, out: ?*VarInfo) Status {
     const index = varIndex(ir, v) orelse return .err_invalid_argument;
     const i = @intFromEnum(index);
     if (out) |o| o.* = .{
@@ -275,35 +267,31 @@ export fn crv_var_get(handle: ?*const Ir, v: u32, out: ?*VarInfo) Status {
 
 // -- Leaves ------------------------------------------------------------------
 
-export fn crv_node_var(handle: ?*Ir, v: u32, out: ?*u32) Status {
+export fn crv_node_var(ir: *Ir, v: u32, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const index = varIndex(ir, v) orelse return .err_invalid_argument;
     return emit(out, ir.varRef(gpa, index));
 }
 
-export fn crv_node_bool(handle: ?*Ir, value: c_int, out: ?*u32) Status {
+export fn crv_node_bool(ir: *Ir, value: c_int, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     return emit(out, ir.boolLit(gpa, value != 0));
 }
 
-export fn crv_node_const_u64(handle: ?*Ir, value: u64, width: u16, out: ?*u32) Status {
+export fn crv_node_const_u64(ir: *Ir, value: u64, width: u16, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     if (width == 0) return .err_invalid_argument;
     return emit(out, ir.constInt(gpa, value, Ir.Type.bit(width)));
 }
 
 export fn crv_node_const_bits(
-    handle: ?*Ir,
+    ir: *Ir,
     words: ?[*]const u64,
     nwords: usize,
     width: u16,
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     if (width == 0) return .err_invalid_argument;
     const magnitude = sliceOf(u64, words, nwords) orelse return .err_invalid_argument;
     return emit(out, ir.constBits(gpa, magnitude, Ir.Type.bit(width)));
@@ -311,17 +299,15 @@ export fn crv_node_const_bits(
 
 // -- Operators ---------------------------------------------------------------
 
-export fn crv_node_unary(handle: ?*Ir, op: c_int, a: u32, out: ?*u32) Status {
+export fn crv_node_unary(ir: *Ir, op: c_int, a: u32, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const tag = tagIn(op, .unary) orelse return .err_invalid_argument;
     const operand = nodeIndex(ir, a) orelse return .err_invalid_argument;
     return emit(out, ir.unary(gpa, tag, operand));
 }
 
-export fn crv_node_binary(handle: ?*Ir, op: c_int, a: u32, b: u32, out: ?*u32) Status {
+export fn crv_node_binary(ir: *Ir, op: c_int, a: u32, b: u32, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const tag = tagIn(op, .binary) orelse return .err_invalid_argument;
     const lhs = nodeIndex(ir, a) orelse return .err_invalid_argument;
     const rhs = nodeIndex(ir, b) orelse return .err_invalid_argument;
@@ -331,9 +317,8 @@ export fn crv_node_binary(handle: ?*Ir, op: c_int, a: u32, b: u32, out: ?*u32) S
     return emit(out, ir.binary(gpa, tag, lhs, rhs));
 }
 
-export fn crv_node_cast(handle: ?*Ir, cast: c_int, a: u32, width: u16, out: ?*u32) Status {
+export fn crv_node_cast(ir: *Ir, cast: c_int, a: u32, width: u16, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const tag = tagIn(cast, .cast) orelse return .err_invalid_argument;
     const operand = nodeIndex(ir, a) orelse return .err_invalid_argument;
     if (width == 0) return .err_invalid_argument;
@@ -345,8 +330,7 @@ export fn crv_node_cast(handle: ?*Ir, cast: c_int, a: u32, width: u16, out: ?*u3
     });
 }
 
-export fn crv_node_width(handle: ?*const Ir, n: u32, out_width: ?*u16) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_node_width(ir: *const Ir, n: u32, out_width: ?*u16) Status {
     const node = nodeIndex(ir, n) orelse return .err_invalid_argument;
     if (out_width) |o| o.* = widthOf(ir, node);
     return .ok;
@@ -354,9 +338,8 @@ export fn crv_node_width(handle: ?*const Ir, n: u32, out_width: ?*u16) Status {
 
 // -- Sets, distributions, structural constraints -----------------------------
 
-export fn crv_node_range(handle: ?*Ir, lo: u32, hi: u32, out: ?*u32) Status {
+export fn crv_node_range(ir: *Ir, lo: u32, hi: u32, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const low = nodeIndex(ir, lo) orelse return .err_invalid_argument;
     const high = nodeIndex(ir, hi) orelse return .err_invalid_argument;
     if (widthOf(ir, low) != widthOf(ir, high)) return .err_width_mismatch;
@@ -364,14 +347,13 @@ export fn crv_node_range(handle: ?*Ir, lo: u32, hi: u32, out: ?*u32) Status {
 }
 
 export fn crv_node_in(
-    handle: ?*Ir,
+    ir: *Ir,
     value: u32,
     members: ?[*]const u32,
     n: usize,
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const tested = nodeIndex(ir, value) orelse return .err_invalid_argument;
     const set = nodeSlice(ir, members, n) orelse return .err_invalid_argument;
     const width = widthOf(ir, tested);
@@ -382,14 +364,13 @@ export fn crv_node_in(
 }
 
 export fn crv_node_dist_item(
-    handle: ?*Ir,
+    ir: *Ir,
     kind: c_int,
     value: u32,
     weight: u32,
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const k = std.enums.fromInt(Ir.DistKind, kind) orelse return .err_invalid_argument;
     const v = nodeIndex(ir, value) orelse return .err_invalid_argument;
     const w = nodeIndex(ir, weight) orelse return .err_invalid_argument;
@@ -397,14 +378,13 @@ export fn crv_node_dist_item(
 }
 
 export fn crv_node_dist(
-    handle: ?*Ir,
+    ir: *Ir,
     value: u32,
     items: ?[*]const u32,
     n: usize,
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const v = nodeIndex(ir, value) orelse return .err_invalid_argument;
     const list = nodeSlice(ir, items, n) orelse return .err_invalid_argument;
     for (list) |item| {
@@ -416,38 +396,35 @@ export fn crv_node_dist(
     return emit(out, ir.dist(gpa, v, list));
 }
 
-export fn crv_node_if(handle: ?*Ir, cond: u32, then_stmt: u32, out: ?*u32) Status {
+export fn crv_node_if(ir: *Ir, cond: u32, then_stmt: u32, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const condition = nodeIndex(ir, cond) orelse return .err_invalid_argument;
     const body = nodeIndex(ir, then_stmt) orelse return .err_invalid_argument;
     return emit(out, ir.ifElse(gpa, condition, body, .null));
 }
 
 export fn crv_node_if_else(
-    handle: ?*Ir,
+    ir: *Ir,
     cond: u32,
     then_stmt: u32,
     else_stmt: u32,
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const condition = nodeIndex(ir, cond) orelse return .err_invalid_argument;
     const body = nodeIndex(ir, then_stmt) orelse return .err_invalid_argument;
     const alternative = nodeIndex(ir, else_stmt) orelse return .err_invalid_argument;
     return emit(out, ir.ifElse(gpa, condition, body, alternative));
 }
 
-export fn crv_node_unique(handle: ?*Ir, nodes: ?[*]const u32, n: usize, out: ?*u32) Status {
+export fn crv_node_unique(ir: *Ir, nodes: ?[*]const u32, n: usize, out: ?*u32) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const set = nodeSlice(ir, nodes, n) orelse return .err_invalid_argument;
     return emit(out, ir.unique(gpa, set));
 }
 
 export fn crv_node_solve_before(
-    handle: ?*Ir,
+    ir: *Ir,
     before: ?[*]const u32,
     nbefore: usize,
     after: ?[*]const u32,
@@ -455,7 +432,6 @@ export fn crv_node_solve_before(
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     const first = varSlice(ir, before, nbefore) orelse return .err_invalid_argument;
     const second = varSlice(ir, after, nafter) orelse return .err_invalid_argument;
     return emit(out, ir.solveBefore(gpa, first, second));
@@ -472,7 +448,7 @@ const ConstraintInfo = extern struct {
 const constraint_soft: u32 = 0x1;
 
 export fn crv_constraint_add(
-    handle: ?*Ir,
+    ir: *Ir,
     id: u32,
     flags: u32,
     stmts: ?[*]const u32,
@@ -480,7 +456,6 @@ export fn crv_constraint_add(
     out: ?*u32,
 ) Status {
     setInvalid(out);
-    const ir = handle orelse return .err_invalid_argument;
     if (flags & ~constraint_soft != 0) return .err_invalid_argument;
     const body = nodeSlice(ir, stmts, n) orelse return .err_invalid_argument;
 
@@ -495,13 +470,11 @@ export fn crv_constraint_add(
     return .ok;
 }
 
-export fn crv_constraint_count(handle: ?*const Ir) u32 {
-    const ir = handle orelse return 0;
+export fn crv_constraint_count(ir: *const Ir) u32 {
     return @intCast(ir.constraints.len);
 }
 
-export fn crv_constraint_get(handle: ?*const Ir, constraint: u32, out: ?*ConstraintInfo) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_constraint_get(ir: *const Ir, constraint: u32, out: ?*ConstraintInfo) Status {
     if (constraint >= ir.constraints.len) return .err_invalid_argument;
     const i: usize = constraint;
     if (out) |o| o.* = .{
@@ -514,19 +487,16 @@ export fn crv_constraint_get(handle: ?*const Ir, constraint: u32, out: ?*Constra
 
 // -- Hashing and caching -----------------------------------------------------
 
-export fn crv_ir_hash(handle: ?*const Ir, out: ?*Ir.Digest) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_ir_hash(ir: *const Ir, out: ?*Ir.Digest) Status {
     if (out) |o| o.* = ir.hash();
     return .ok;
 }
 
-export fn crv_ir_serialized_size(handle: ?*const Ir) usize {
-    const ir = handle orelse return 0;
+export fn crv_ir_serialized_size(ir: *const Ir) usize {
     return ir.serializedSize();
 }
 
-export fn crv_ir_serialize(handle: ?*const Ir, buf: ?*anyopaque, cap: usize, written: ?*usize) Status {
-    const ir = handle orelse return .err_invalid_argument;
+export fn crv_ir_serialize(ir: *const Ir, buf: ?*anyopaque, cap: usize, written: ?*usize) Status {
     const size = ir.serializedSize();
     if (written) |w| w.* = size;
     if (cap < size) return .err_buffer_too_small;
@@ -539,14 +509,12 @@ export fn crv_ir_serialize(handle: ?*const Ir, buf: ?*anyopaque, cap: usize, wri
     return .ok;
 }
 
-export fn crv_ir_deserialize(buf: ?*const anyopaque, len: usize, out: ?*Ir) Status {
-    const dst = out orelse return .err_invalid_argument;
+export fn crv_ir_deserialize(buf: *const anyopaque, len: usize, out: *Ir) Status {
     // Initialized up front, so a rejected blob still leaves the caller's
     // storage holding an empty IR that `crv_ir_deinit` accepts.
-    dst.* = .{};
-    const src = buf orelse return .err_invalid_argument;
+    out.* = .{};
 
-    dst.* = Ir.deserialize(gpa, @as([*]const u8, @ptrCast(src))[0..len]) catch |err| {
+    out.* = Ir.deserialize(gpa, @as([*]const u8, @ptrCast(buf))[0..len]) catch |err| {
         return statusOf(err);
     };
     return .ok;
@@ -565,19 +533,16 @@ const Stats = extern struct {
     hits: u64,
 };
 
-export fn crv_value_words(handle: ?*const Ir) usize {
-    const ir = handle orelse return 0;
+export fn crv_value_words(ir: *const Ir) usize {
     return Solver.valueLimbs(ir);
 }
 
 export fn crv_rejection_sampler_new(
-    handle: ?*const Ir,
+    ir: *const Ir,
     options: ?*const RejectionOptions,
-    out: ?*?*CSolver,
+    out: *?*CSolver,
 ) Status {
-    const result = out orelse return .err_invalid_argument;
-    result.* = null;
-    const ir = handle orelse return .err_invalid_argument;
+    out.* = null;
 
     // The engine indexes the IR's arrays unchecked, so it only ever sees one
     // that has been vetted — even if the caller assembled it by hand.
@@ -591,20 +556,22 @@ export fn crv_rejection_sampler_new(
 
     const engine = RejectionSampler.init(gpa, ir, opts) catch |err| return statusOf(err);
 
-    const s = gpa.create(CSolver) catch {
+    const solver = gpa.create(CSolver) catch {
         var mutable = engine;
         mutable.deinit(gpa);
         return .err_oom;
     };
-    s.* = .{
+    solver.* = .{
         .value_words = Solver.valueLimbs(ir),
         .var_count = ir.vars.len,
         .engine = .{ .rejection = engine },
     };
-    result.* = s;
+    out.* = solver;
     return .ok;
 }
 
+/// The one export that takes a nullable handle, so that freeing the result of a
+/// failed `crv_rejection_sampler_new` is a no-op — the contract `free` has.
 export fn crv_solver_free(handle: ?*CSolver) void {
     const s = handle orelse return;
     switch (s.engine) {
@@ -613,9 +580,7 @@ export fn crv_solver_free(handle: ?*CSolver) void {
     gpa.destroy(s);
 }
 
-export fn crv_solver_next(handle: ?*CSolver, values: ?[*]u64, nwords: usize) Status {
-    const s = handle orelse return .err_invalid_argument;
-
+export fn crv_solver_next(s: *CSolver, values: ?[*]u64, nwords: usize) Status {
     const needed = s.value_words * s.var_count;
     if (nwords < needed) return .err_buffer_too_small;
 
@@ -628,8 +593,7 @@ export fn crv_solver_next(handle: ?*CSolver, values: ?[*]u64, nwords: usize) Sta
     return if (s.solver().next(out)) .ok else .exhausted;
 }
 
-export fn crv_solver_stats(handle: ?*const CSolver, out: ?*Stats) Status {
-    const s = handle orelse return .err_invalid_argument;
+export fn crv_solver_stats(s: *const CSolver, out: ?*Stats) Status {
     if (out) |o| o.* = switch (s.engine) {
         .rejection => |*e| .{ .attempts = e.attempts, .hits = e.hits },
     };
@@ -694,17 +658,16 @@ test "crv.h declares the IR's own enum values" {
     }
 }
 
-test "builders reject bad handles, indices, and widths" {
+test "builders reject bad indices, op codes, and widths" {
     var ir: Ir = undefined;
     crv_ir_init(&ir);
     defer crv_ir_deinit(&ir);
 
+    // An index no node has, an op code that decodes to nothing, and a zero
+    // width. A refused builder leaves its out-parameter invalid, never stale.
     var node: u32 = 0;
-    try std.testing.expectEqual(Status.err_invalid_argument, crv_node_bool(null, 1, &node));
-    try std.testing.expectEqual(invalid, node);
-
-    // An index no node has, an op code that decodes to nothing, and a zero width.
     try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, code(.neg), 7, &node));
+    try std.testing.expectEqual(invalid, node);
     try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, 999, 0, &node));
     try std.testing.expectEqual(Status.err_invalid_argument, crv_node_const_u64(&ir, 1, 0, &node));
 
@@ -749,14 +712,15 @@ test "solutions come back through a caller-sized buffer" {
     var solver: ?*CSolver = null;
     try std.testing.expectEqual(Status.ok, crv_rejection_sampler_new(&ir, null, &solver));
     defer crv_solver_free(solver);
+    const s = solver.?;
 
     var values: [1]u64 = undefined;
-    try std.testing.expectEqual(Status.err_buffer_too_small, crv_solver_next(solver, &values, 0));
-    try std.testing.expectEqual(Status.ok, crv_solver_next(solver, &values, 1));
+    try std.testing.expectEqual(Status.err_buffer_too_small, crv_solver_next(s, &values, 0));
+    try std.testing.expectEqual(Status.ok, crv_solver_next(s, &values, 1));
     try std.testing.expectEqual(@as(u64, 42), values[0]);
 
     var stats: Stats = undefined;
-    try std.testing.expectEqual(Status.ok, crv_solver_stats(solver, &stats));
+    try std.testing.expectEqual(Status.ok, crv_solver_stats(s, &stats));
     try std.testing.expectEqual(@as(u64, 1), stats.hits);
 }
 
