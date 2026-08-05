@@ -10,18 +10,13 @@
 //! worklist, no recursion, and structural sharing in the IR is inherited for
 //! free: a subexpression referenced twice is compiled once.
 //!
-//! **Semantics are mirrored from `RejectionSampler`, edge cases included**,
-//! because differential testing between the two engines is the main correctness
-//! net and it is only worth anything if they agree exactly. That means division
-//! by zero yields zero, `sra` takes its sign from the *result* width, shift
-//! amounts saturate at the width, and so on.
-//!
-//! One deliberate divergence: when a binary operator's operands have mismatched
-//! widths, the sampler is internally inconsistent (`eq` compares raw 64-bit
-//! values while `slt` truncates to the left operand's width). Such IR is
-//! malformed — `typeOf` gives an operator a single width — so this blaster
-//! instead fits both operands to the operator's own width, which is at least
-//! self-consistent.
+//! The operands of a value-producing operator share one width: `typeOf` gives
+//! such a node a single type, and widths change only through the explicit cast
+//! nodes. Mismatched operands are malformed IR, so they trip an assert rather
+//! than being quietly reinterpreted — which also means operand vectors can be
+//! read in place instead of copied through a width-fitting temporary. The one
+//! exception is a shift amount, which is a count rather than a value of the
+//! operand's type and may be any width.
 //!
 //! **What is expensive.** Bit-blasting is where a BDD engine gets to be fast or
 //! gets to explode, and the difference is not subtle:
@@ -186,30 +181,25 @@ const Blaster = struct {
             .sext => fitS(out, b.vec(d.lhs)),
             .trunc => fitU(out, b.vec(d.lhs)),
 
-            .bnot => {
-                const a = try b.fitTmp(d.lhs, w, .unsigned);
-                for (out, a) |*o, x| o.* = x.not();
+            .bnot => for (out, b.vec(d.lhs)) |*o, x| {
+                o.* = x.not();
             },
             .neg => {
-                const a = try b.fitTmp(d.lhs, w, .unsigned);
                 const zeros = try b.constVec(w, 0);
-                _ = try b.addInto(out, zeros, try b.notVec(a), .one);
+                _ = try b.addInto(out, zeros, try b.notVec(b.vec(d.lhs)), .one);
             },
             .add => {
-                const a = try b.fitTmp(d.lhs, w, .unsigned);
-                const c = try b.fitTmp(d.rhs, w, .unsigned);
-                _ = try b.addInto(out, a, c, .zero);
+                b.assertOperands(d);
+                _ = try b.addInto(out, b.vec(d.lhs), b.vec(d.rhs), .zero);
             },
             .sub => {
-                const a = try b.fitTmp(d.lhs, w, .unsigned);
-                const c = try b.fitTmp(d.rhs, w, .unsigned);
-                _ = try b.addInto(out, a, try b.notVec(c), .one);
+                b.assertOperands(d);
+                _ = try b.addInto(out, b.vec(d.lhs), try b.notVec(b.vec(d.rhs)), .one);
             },
 
             .band, .bor, .bxor => {
-                const a = try b.fitTmp(d.lhs, w, .unsigned);
-                const c = try b.fitTmp(d.rhs, w, .unsigned);
-                for (out, a, c) |*o, x, y| o.* = switch (tag) {
+                b.assertOperands(d);
+                for (out, b.vec(d.lhs), b.vec(d.rhs)) |*o, x, y| o.* = switch (tag) {
                     .band => try b.m.conj(x, y),
                     .bor => try b.m.disj(x, y),
                     else => try b.m.xor(x, y),
@@ -262,14 +252,11 @@ const Blaster = struct {
 
     // -- Width fitting -------------------------------------------------------
 
-    /// Node `src` fitted to `w` bits in scratch, zero- or sign-extended.
-    fn fitTmp(b: *Blaster, src: u32, w: u16, mode: Mode) Allocator.Error![]Ref {
-        const out = try b.tmp(w);
-        switch (mode) {
-            .unsigned => fitU(out, b.vec(src)),
-            .signed => fitS(out, b.vec(src)),
-        }
-        return out;
+    /// A value-producing operator gives its operands one width; anything else
+    /// is malformed IR. Compiled out in release builds, and what licenses the
+    /// callers to read operand vectors in place.
+    fn assertOperands(b: *const Blaster, d: Ir.Node.Data) void {
+        std.debug.assert(b.width(d.lhs) == b.width(d.rhs));
     }
 
     const Mode = enum { unsigned, signed };
@@ -303,8 +290,9 @@ const Blaster = struct {
     }
 
     fn mul(b: *Blaster, out: []Ref, d: Ir.Node.Data, w: u16) Error!void {
-        const a = try b.fitTmp(d.lhs, w, .unsigned);
-        const c = try b.fitTmp(d.rhs, w, .unsigned);
+        b.assertOperands(d);
+        const a = b.vec(d.lhs);
+        const c = b.vec(d.rhs);
 
         // `x * 2^k` is a shift, and a constant operand needs no AND gate.
         if (constantShift(c)) |k| return b.shiftConst(out, a, k, .zero);
@@ -337,8 +325,9 @@ const Blaster = struct {
     const DivPart = enum { quotient, remainder };
 
     fn divide(b: *Blaster, out: []Ref, d: Ir.Node.Data, w: u16, mode: Mode, part: DivPart) Error!void {
-        const a_raw = try b.fitTmp(d.lhs, w, .unsigned);
-        const c_raw = try b.fitTmp(d.rhs, w, .unsigned);
+        b.assertOperands(d);
+        const a_raw = b.vec(d.lhs);
+        const c_raw = b.vec(d.rhs);
 
         // Unsigned division by a power of two is wiring: the quotient is a
         // shift and the remainder is a mask. This is the alignment-constraint
@@ -439,7 +428,10 @@ const Blaster = struct {
     }
 
     fn shift(b: *Blaster, out: []Ref, tag: Ir.Node.Tag, d: Ir.Node.Data, w: u16) Error!void {
-        const a = try b.fitTmp(d.lhs, w, .unsigned);
+        // The shifted value carries the result width by construction; the
+        // amount is a count, not a value of that type, so it may be any width.
+        std.debug.assert(b.width(d.lhs) == w);
+        const a = b.vec(d.lhs);
         const amount = b.vec(d.rhs);
         // For `sra` the sign comes from the result width, matching the sampler.
         const fill: Ref = if (tag == .sra) a[w - 1] else .zero;
@@ -481,11 +473,9 @@ const Blaster = struct {
     // -- Comparisons ---------------------------------------------------------
 
     fn compare(b: *Blaster, tag: Ir.Node.Tag, d: Ir.Node.Data) Error!Ref {
-        // Both operands are read at the operator's own width — see the note on
-        // mismatched widths in the module comment.
-        const w = b.width(d.lhs);
-        const a = try b.fitTmp(d.lhs, w, .unsigned);
-        const c = try b.fitTmp(d.rhs, w, .unsigned);
+        b.assertOperands(d);
+        const a = b.vec(d.lhs);
+        const c = b.vec(d.rhs);
 
         return switch (tag) {
             .eq => try b.eqChain(a, c),
@@ -548,20 +538,23 @@ const Blaster = struct {
         const e = b.ir.extra.items;
         const members = e[d.rhs + 1 ..][0..e[d.rhs]];
         const w = b.width(d.lhs);
-        const value = try b.fitTmp(d.lhs, w, .unsigned);
+        const value = b.vec(d.lhs);
 
         var acc: Ref = .zero;
-        for (members) |raw| {
-            const member: u32 = raw;
+        for (members) |member| {
             const hit = if (b.ir.nodes.items(.tag)[member] == .range) blk: {
                 const rd = b.ir.nodes.items(.data)[member];
-                const lo = try b.fitTmp(rd.lhs, w, .unsigned);
-                const hi = try b.fitTmp(rd.rhs, w, .unsigned);
+                // A range's bounds are compared against the value, so all three
+                // must agree in width.
+                std.debug.assert(b.width(rd.lhs) == w and b.width(rd.rhs) == w);
                 break :blk try b.m.conj(
-                    try b.ugeChain(value, lo),
-                    try b.ugeChain(hi, value),
+                    try b.ugeChain(value, b.vec(rd.lhs)),
+                    try b.ugeChain(b.vec(rd.rhs), value),
                 );
-            } else try b.eqChain(value, try b.fitTmp(member, w, .unsigned));
+            } else blk: {
+                std.debug.assert(b.width(member) == w);
+                break :blk try b.eqChain(value, b.vec(member));
+            };
             acc = try b.m.disj(acc, hit);
         }
         return acc;
@@ -587,10 +580,9 @@ const Blaster = struct {
         var acc: Ref = .one;
         for (items, 0..) |x, k| {
             for (items[k + 1 ..]) |y| {
-                const w = @max(b.width(x), b.width(y));
-                const lhs = try b.fitTmp(x, w, .unsigned);
-                const rhs = try b.fitTmp(y, w, .unsigned);
-                acc = try b.m.conj(acc, (try b.eqChain(lhs, rhs)).not());
+                // Values compared for distinctness must be the same width.
+                std.debug.assert(b.width(x) == b.width(y));
+                acc = try b.m.conj(acc, (try b.eqChain(b.vec(x), b.vec(y))).not());
             }
         }
         return acc;

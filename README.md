@@ -177,11 +177,11 @@ draw in 67 million and gives up:
 
 | Constraint set | Build | Per draw |
 | --- | --- | --- |
-| Windowed + aligned 32-bit address | 0.5 ms | 160 ns |
-| `x + y == z`, three 32-bit variables | 0.9 ms | 640 ns |
-| `x % 64 == 0`, 32-bit (power of two → wiring) | 0.5 ms | 80 ns |
-| `x % 100 == 7`, 32-bit (restoring division array) | 22 ms | 220 ns |
-| 64 independent 32-bit range constraints | 6 ms | 10.7 µs |
+| Windowed + aligned 32-bit address | 0.35 ms | 150 ns |
+| `x + y == z`, three 32-bit variables | 0.5 ms | 620 ns |
+| `x % 64 == 0`, 32-bit (power of two → wiring) | 0.5 ms | 50 ns |
+| `x % 100 == 7`, 32-bit (restoring division array) | 18 ms | 190 ns |
+| 64 independent 32-bit range constraints | 3 ms | 10.3 µs |
 
 Four decisions carry that performance:
 
