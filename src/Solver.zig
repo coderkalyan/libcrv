@@ -18,6 +18,15 @@ const Ir = @import("Ir.zig");
 
 const Solver = @This();
 
+comptime {
+    // A solution buffer is a vector of `Value`s, while `valueLimbs` counts
+    // big-int limbs; the two descriptions only coincide where a limb is 64 bits
+    // wide. Every 64-bit target qualifies. Stating it here turns a 32-bit build
+    // into a build error rather than a silent disagreement about the layout of
+    // every value the solver hands back.
+    if (@bitSizeOf(std.math.big.Limb) != 64) @compileError("libcrv requires a 64-bit big-int limb");
+}
+
 /// One limb of a variable's value (a 64-bit little-endian word).
 pub const Value = u64;
 

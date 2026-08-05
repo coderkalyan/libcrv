@@ -25,7 +25,8 @@
 //!
 //! Scope: the scalar expression subset. `dist` weighting and the structural
 //! constraints (`if_else`, `unique`, `solve_before`, `foreach`) are roadmap;
-//! evaluating one panics for now.
+//! `init` rejects an IR containing one (see `supports`), so the evaluator only
+//! ever meets nodes it can handle.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -80,16 +81,42 @@ pub const Options = struct {
     max_attempts: u32 = 10_000,
 };
 
-pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Allocator.Error!RejectionSampler {
+pub const InitError = Allocator.Error || error{
+    /// The IR contains a node this engine cannot evaluate — see `supports`.
+    UnsupportedNode,
+};
+
+/// Whether this engine can evaluate `tag`. `dist` weighting and the structural
+/// constraints are roadmap; `init` rejects an IR that contains one, so the
+/// evaluator never meets a node it would have to give up on halfway through a
+/// draw.
+pub fn supports(tag: Ir.Node.Tag) bool {
+    return switch (tag) {
+        .dist,
+        .dist_weight_eq,
+        .dist_weight_div,
+        .if_else,
+        .unique,
+        .solve_before,
+        .foreach,
+        => false,
+        else => true,
+    };
+}
+
+/// Bind a sampler to `ir`, which must outlive it and must not be mutated while
+/// it is bound — node types are resolved once, here.
+pub fn init(gpa: Allocator, ir: *const Ir, options: Options) InitError!RejectionSampler {
     const n = ir.nodes.len;
 
-    const types = try gpa.alloc(Ir.Type, n);
+    for (ir.nodes.items(.tag)) |tag| {
+        if (!supports(tag)) return error.UnsupportedNode;
+    }
+
+    const types = try ir.resolveTypes(gpa);
     errdefer gpa.free(types);
     var max_width: u16 = 1;
-    for (types, 0..) |*t, i| {
-        t.* = ir.typeOf(@enumFromInt(@as(u32, @intCast(i))));
-        max_width = @max(max_width, t.width);
-    }
+    for (types) |t| max_width = @max(max_width, t.width);
 
     const value_limbs = Solver.valueLimbs(ir);
 
@@ -295,6 +322,7 @@ fn evaluate(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const I
             .unique,
             .solve_before,
             .foreach,
+            // Rejected by `init`, so reaching one here is a bug in `supports`.
             => @panic("RejectionSampler: unsupported IR node"),
         }
     }
@@ -780,6 +808,17 @@ test "wide (>64-bit) literal in a constraint" {
         try std.testing.expect(sampler.next(out));
         try std.testing.expect(out[1] >= (1 << 36)); // high limb clears the bound
     }
+}
+
+test "init rejects a node the engine cannot evaluate" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(4), .kind = .rand });
+    try constraintOne(gpa, &ir, try ir.unique(gpa, &.{try ir.varRef(gpa, x)}));
+
+    try std.testing.expectError(error.UnsupportedNode, RejectionSampler.init(gpa, &ir, .{}));
 }
 
 test "solves through the Solver interface" {

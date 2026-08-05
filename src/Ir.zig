@@ -351,6 +351,22 @@ pub fn constBig(ir: *Ir, gpa: Allocator, value: std.math.big.int.Const, ty: Type
     }{ .v = value });
 }
 
+/// A typed integer literal from a little-endian array of 64-bit words, taken
+/// modulo `ty.width` bits. Like `constBig` this is an unsigned bit pattern, but
+/// it is expressed in fixed 64-bit words rather than `std.math.big` limbs, so
+/// the encoding does not depend on the host's limb width — which is what the C
+/// ABI is defined in terms of.
+pub fn constBits(ir: *Ir, gpa: Allocator, words: []const u64, ty: Type) Allocator.Error!Node.Index {
+    return ir.appendLiteral(gpa, ty, struct {
+        w: []const u64,
+        fn word(ctx: @This(), j: u32) u32 {
+            const i = j / 2;
+            if (i >= ctx.w.len) return 0;
+            return @truncate(ctx.w[i] >> @intCast(32 * (j % 2)));
+        }
+    }{ .w = words });
+}
+
 /// Number of `u32` words a `width`-bit literal magnitude occupies (`>= 1`).
 fn litWords(width: u16) u32 {
     return @max(1, (@as(u32, width) + 31) / 32);
@@ -414,13 +430,82 @@ pub fn range(ir: *Ir, gpa: Allocator, lo: Node.Index, hi: Node.Index) Allocator.
     return ir.addNode(gpa, .{ .tag = .range, .data = .{ .lhs = @intFromEnum(lo), .rhs = @intFromEnum(hi) } });
 }
 
-/// Set membership — SystemVerilog `value inside { members... }`.
+/// Set membership — SystemVerilog `value inside { members... }`. A member is a
+/// value node or a `range` node.
 pub fn in(ir: *Ir, gpa: Allocator, value: Node.Index, members: []const Node.Index) Allocator.Error!Node.Index {
-    const start: u32 = @intCast(ir.extra.items.len);
-    try ir.extra.ensureUnusedCapacity(gpa, members.len + 1);
-    ir.extra.appendAssumeCapacity(@intCast(members.len));
-    for (members) |m| ir.extra.appendAssumeCapacity(@intFromEnum(m));
+    const start = try ir.addCounted(gpa, Node.Index, members);
     return ir.addNode(gpa, .{ .tag = .in, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
+}
+
+pub const DistKind = enum { eq, div };
+
+/// One weighted item of a `dist`: `value := weight` (`.eq`) or `value :/ weight`
+/// (`.div`, the weight split across the range). `value` is a value node or a
+/// `range` node.
+pub fn distItem(
+    ir: *Ir,
+    gpa: Allocator,
+    kind: DistKind,
+    value: Node.Index,
+    weight: Node.Index,
+) Allocator.Error!Node.Index {
+    const tag: Node.Tag = switch (kind) {
+        .eq => .dist_weight_eq,
+        .div => .dist_weight_div,
+    };
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{ .lhs = @intFromEnum(value), .rhs = @intFromEnum(weight) } });
+}
+
+/// Weighted distribution — `value dist { items... }`, each item from `distItem`.
+pub fn dist(ir: *Ir, gpa: Allocator, value: Node.Index, items: []const Node.Index) Allocator.Error!Node.Index {
+    const start = try ir.addCounted(gpa, Node.Index, items);
+    return ir.addNode(gpa, .{ .tag = .dist, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
+}
+
+/// `if (cond) then_stmt else else_stmt`. Pass `.null` for `else_stmt` when
+/// there is no `else` branch.
+pub fn ifElse(
+    ir: *Ir,
+    gpa: Allocator,
+    cond: Node.Index,
+    then_stmt: Node.Index,
+    else_stmt: Node.Index,
+) Allocator.Error!Node.Index {
+    const start: u32 = @intCast(ir.extra.items.len);
+    try ir.extra.appendSlice(gpa, &.{ @intFromEnum(then_stmt), @intFromEnum(else_stmt) });
+    return ir.addNode(gpa, .{ .tag = .if_else, .data = .{ .lhs = @intFromEnum(cond), .rhs = start } });
+}
+
+/// `unique { nodes... }` — every listed value must differ from the others.
+pub fn unique(ir: *Ir, gpa: Allocator, nodes: []const Node.Index) Allocator.Error!Node.Index {
+    const start = try ir.addCounted(gpa, Node.Index, nodes);
+    return ir.addNode(gpa, .{ .tag = .unique, .data = .{ .lhs = start } });
+}
+
+/// `solve before... before after...` — a solve-ordering hint, not a boolean.
+pub fn solveBefore(
+    ir: *Ir,
+    gpa: Allocator,
+    before: []const Variable.Index,
+    after: []const Variable.Index,
+) Allocator.Error!Node.Index {
+    const start: u32 = @intCast(ir.extra.items.len);
+    try ir.extra.ensureUnusedCapacity(gpa, before.len + after.len + 2);
+    inline for (.{ before, after }) |group| {
+        ir.extra.appendAssumeCapacity(@intCast(group.len));
+        for (group) |v| ir.extra.appendAssumeCapacity(@intFromEnum(v));
+    }
+    return ir.addNode(gpa, .{ .tag = .solve_before, .data = .{ .lhs = start } });
+}
+
+/// Append `[count, items...]` to `extra` and return the start offset — the
+/// encoding every variable-arity node uses for its payload.
+fn addCounted(ir: *Ir, gpa: Allocator, comptime T: type, items: []const T) Allocator.Error!u32 {
+    const start: u32 = @intCast(ir.extra.items.len);
+    try ir.extra.ensureUnusedCapacity(gpa, items.len + 1);
+    ir.extra.appendAssumeCapacity(@intCast(items.len));
+    for (items) |item| ir.extra.appendAssumeCapacity(@intFromEnum(item));
+    return start;
 }
 
 // -- Accessors ---------------------------------------------------------------
@@ -453,22 +538,102 @@ pub const default_width: u16 = 32;
 /// and casts are explicitly typed; every other operator propagates its left
 /// operand's width, and comparisons/logical operators yield a 1-bit `bool`.
 /// Widths only ever change through the `zext`/`sext`/`trunc` casts.
+///
+/// Recursion depth is the expression's depth. To type a whole IR, prefer
+/// `resolveTypes`, which is linear and iterative.
 pub fn typeOf(ir: *const Ir, node: Node.Index) Type {
     const i = @intFromEnum(node);
+    const tag = ir.nodes.items(.tag)[i];
     const d = ir.nodes.items(.data)[i];
-    return switch (ir.nodes.items(.tag)[i]) {
-        .int_literal => ir.literalType(node),
-        .bool_literal => .{ .width = 1 },
+    return if (propagatesOperandType(tag)) ir.typeOf(@enumFromInt(d.lhs)) else ir.ownType(tag, d);
+}
+
+/// Resolve every node's type in one linear forward pass, returning a
+/// caller-owned array indexed by `Node.Index`. Same answer as `typeOf` node by
+/// node, but linear instead of quadratic in the tree depth, and iterative — an
+/// operand always has a lower index than its user, so a single sweep suffices.
+/// Requires an IR that `validate` accepts (one built through this API always
+/// is).
+pub fn resolveTypes(ir: *const Ir, gpa: Allocator) Allocator.Error![]Type {
+    const out = try gpa.alloc(Type, ir.nodes.len);
+    errdefer gpa.free(out);
+    for (ir.nodes.items(.tag), ir.nodes.items(.data), out, 0..) |tag, d, *t, i| {
+        t.* = ir.widthOf(tag, d, out[0..i]);
+    }
+    return out;
+}
+
+/// One node's type, given the already-resolved types of every lower-indexed
+/// node — the non-recursive form of `typeOf`, for callers that keep such a
+/// table (see `resolveTypes`).
+pub fn widthOf(ir: *const Ir, tag: Node.Tag, d: Node.Data, resolved: []const Type) Type {
+    return if (propagatesOperandType(tag)) resolved[d.lhs] else ir.ownType(tag, d);
+}
+
+/// Whether a node's type is simply its left operand's. These are the only tags
+/// whose type cannot be read off the node itself, and the reason typing is
+/// recursive at all.
+fn propagatesOperandType(tag: Node.Tag) bool {
+    return switch (tag) {
+        .neg,
+        .bnot,
+        .add,
+        .sub,
+        .mul,
+        .sdiv,
+        .udiv,
+        .smod,
+        .umod,
+        .band,
+        .bor,
+        .bxor,
+        .sll,
+        .srl,
+        .sra,
+        .range,
+        => true,
+
+        .int_literal,
+        .bool_literal,
+        .var_ref,
+        .zext,
+        .sext,
+        .trunc,
+        .lnot,
+        .eq,
+        .ne,
+        .slt,
+        .ult,
+        .sle,
+        .ule,
+        .sgt,
+        .ugt,
+        .sge,
+        .uge,
+        .land,
+        .lor,
+        .implies,
+        .iff,
+        .in,
+        .dist,
+        .dist_weight_eq,
+        .dist_weight_div,
+        .if_else,
+        .unique,
+        .solve_before,
+        .foreach,
+        => false,
+    };
+}
+
+/// The type of a node that carries it, for the tags `propagatesOperandType`
+/// answers `false` for. Everything not explicitly typed is a 1-bit boolean.
+fn ownType(ir: *const Ir, tag: Node.Tag, d: Node.Data) Type {
+    return switch (tag) {
+        .int_literal => @bitCast(d.rhs),
         .var_ref => varType(ir.vars.items(.ty)[d.lhs]),
-
-        .zext, .sext, .trunc => .{ .width = ir.castWidth(node) },
-
-        .neg, .bnot => ir.typeOf(@enumFromInt(d.lhs)),
-        .add, .sub, .mul, .sdiv, .udiv, .smod, .umod, .band, .bor, .bxor, .sll, .srl, .sra => ir.typeOf(@enumFromInt(d.lhs)),
-        .range => ir.typeOf(@enumFromInt(d.lhs)),
-
-        .eq, .ne, .slt, .ult, .sle, .ule, .sgt, .ugt, .sge, .uge, .lnot, .land, .lor, .implies, .iff, .in => .{ .width = 1 },
-        .dist, .dist_weight_eq, .dist_weight_div, .if_else, .unique, .solve_before, .foreach => .{ .width = 1 },
+        .zext, .sext, .trunc => .{ .width = @intCast(d.rhs) },
+        else => .{ .width = 1 },
     };
 }
 
@@ -481,6 +646,206 @@ pub fn constraintBody(ir: *const Ir, index: Constraint.Index) []const Node.Index
     const body = ir.constraints.items(.body)[@intFromEnum(index)];
     const raw = ir.extra.items[@intFromEnum(body.start)..][0..body.len];
     return @ptrCast(raw);
+}
+
+// -- Validation --------------------------------------------------------------
+
+pub const ValidateError = error{
+    /// The IR is not structurally sound; see `validate`.
+    InvalidIr,
+};
+
+/// Check that the IR is structurally sound, so that consumers can walk it
+/// without bounds checks. An IR built through this API always passes; the point
+/// of the pass is untrusted input — `deserialize` runs it before handing back a
+/// cache blob, and a C caller can run it on an IR it assembled by hand.
+///
+/// It checks that:
+///
+///   * every tag and variable kind is a value this build knows;
+///   * every operand index refers to an existing node with a *lower* index —
+///     evaluation is a single forward sweep, so this is what makes the tree
+///     acyclic and in evaluation order — and every variable index exists;
+///   * every `extra` payload (literal words, `in`/`dist`/`unique` members,
+///     `solve_before` lists, `foreach` bodies, constraint bodies) lies inside
+///     the pool and has the length its node claims;
+///   * literal and cast widths are non-zero and fit a `u16`;
+///   * operand widths agree wherever the evaluator assumes a single width
+///     (arithmetic, comparisons, `range` bounds, `in` members). Shifts and the
+///     logical operators are exempt: they read the right operand at its own
+///     width, or only for truthiness.
+///
+/// `gpa` is used for a scratch array of resolved node types and is released
+/// before returning.
+pub fn validate(ir: *const Ir, gpa: Allocator) (Allocator.Error || ValidateError)!void {
+    if (ir.nodes.len > std.math.maxInt(u32)) return error.InvalidIr;
+    if (ir.vars.len > std.math.maxInt(u32)) return error.InvalidIr;
+    if (ir.extra.items.len > std.math.maxInt(u32)) return error.InvalidIr;
+
+    // Enum-typed bytes are checked first, as raw bytes: an out-of-range tag or
+    // kind loaded as its enum type would be illegal behavior, and deserialized
+    // bytes have not been vetted yet.
+    for (std.mem.sliceAsBytes(ir.nodes.items(.tag))) |raw| {
+        if (std.enums.fromInt(Node.Tag, raw) == null) return error.InvalidIr;
+    }
+    for (std.mem.sliceAsBytes(ir.vars.items(.kind))) |raw| {
+        if (std.enums.fromInt(Variable.Kind, raw) == null) return error.InvalidIr;
+    }
+
+    const types = try gpa.alloc(Type, ir.nodes.len);
+    defer gpa.free(types);
+
+    const tags = ir.nodes.items(.tag);
+    const datas = ir.nodes.items(.data);
+    for (tags, datas, 0..) |tag, d, iu| {
+        const i: u32 = @intCast(iu);
+        switch (tag) {
+            .int_literal => {
+                const ty: Type = @bitCast(d.rhs);
+                if (ty.width == 0) return error.InvalidIr;
+                if ((try counted(ir, d.lhs)).len != litWords(ty.width)) return error.InvalidIr;
+            },
+            .bool_literal => if (d.lhs > 1) return error.InvalidIr,
+            .var_ref => try below(d.lhs, ir.vars.len),
+
+            .zext, .sext, .trunc => {
+                try below(d.lhs, i);
+                if (d.rhs == 0 or d.rhs > std.math.maxInt(u16)) return error.InvalidIr;
+            },
+
+            .neg, .bnot, .lnot => try below(d.lhs, i),
+
+            .add,
+            .sub,
+            .mul,
+            .sdiv,
+            .udiv,
+            .smod,
+            .umod,
+            .band,
+            .bor,
+            .bxor,
+            .eq,
+            .ne,
+            .slt,
+            .ult,
+            .sle,
+            .ule,
+            .sgt,
+            .ugt,
+            .sge,
+            .uge,
+            .range,
+            .sll,
+            .srl,
+            .sra,
+            .land,
+            .lor,
+            .implies,
+            .iff,
+            .dist_weight_eq,
+            .dist_weight_div,
+            => {
+                try below(d.lhs, i);
+                try below(d.rhs, i);
+                if (requiresEqualWidths(tag) and types[d.lhs].width != types[d.rhs].width) {
+                    return error.InvalidIr;
+                }
+            },
+
+            .in => {
+                try below(d.lhs, i);
+                for (try counted(ir, d.rhs)) |m| {
+                    try below(m, i);
+                    if (types[m].width != types[d.lhs].width) return error.InvalidIr;
+                }
+            },
+            .dist => {
+                try below(d.lhs, i);
+                for (try counted(ir, d.rhs)) |item| {
+                    try below(item, i);
+                    switch (tags[item]) {
+                        .dist_weight_eq, .dist_weight_div => {},
+                        else => return error.InvalidIr,
+                    }
+                }
+            },
+            .if_else => {
+                try below(d.lhs, i);
+                const arms = try window(ir, d.rhs, 2);
+                try below(arms[0], i);
+                if (arms[1] != @intFromEnum(Node.Index.null)) try below(arms[1], i);
+            },
+            .unique => for (try counted(ir, d.lhs)) |m| try below(m, i),
+            .solve_before => {
+                const before = try counted(ir, d.lhs);
+                const after = try counted(ir, @as(usize, d.lhs) + 1 + before.len);
+                for (before) |v| try below(v, ir.vars.len);
+                for (after) |v| try below(v, ir.vars.len);
+            },
+            .foreach => {
+                try below(d.lhs, ir.vars.len);
+                try below((try window(ir, d.rhs, 1))[0], ir.vars.len);
+                for (try counted(ir, @as(usize, d.rhs) + 1)) |b| try below(b, i);
+            },
+        }
+        types[i] = ir.widthOf(tag, d, types[0..i]);
+    }
+
+    for (ir.constraints.items(.body)) |body| {
+        for (try window(ir, @intFromEnum(body.start), body.len)) |stmt| {
+            try below(stmt, ir.nodes.len);
+        }
+    }
+}
+
+/// Whether a binary `tag`'s operands must have the same width. True for the
+/// operators the evaluator runs at a single width; false for the shifts, which
+/// read the shift amount at its own width, and for the logical operators, which
+/// only test for non-zero.
+pub fn requiresEqualWidths(tag: Node.Tag) bool {
+    return switch (tag) {
+        .add,
+        .sub,
+        .mul,
+        .sdiv,
+        .udiv,
+        .smod,
+        .umod,
+        .band,
+        .bor,
+        .bxor,
+        .eq,
+        .ne,
+        .slt,
+        .ult,
+        .sle,
+        .ule,
+        .sgt,
+        .ugt,
+        .sge,
+        .uge,
+        .range,
+        => true,
+        else => false,
+    };
+}
+
+fn below(index: u32, limit: usize) ValidateError!void {
+    if (index >= limit) return error.InvalidIr;
+}
+
+/// The `extra` window `[at, at + len)`, or `InvalidIr` if it runs off the pool.
+fn window(ir: *const Ir, at: usize, len: usize) ValidateError![]const u32 {
+    const pool = ir.extra.items;
+    if (at > pool.len or len > pool.len - at) return error.InvalidIr;
+    return pool[at..][0..len];
+}
+
+/// The items of a `[count, items...]` payload at `at`.
+fn counted(ir: *const Ir, at: usize) ValidateError![]const u32 {
+    const count = (try window(ir, at, 1))[0];
+    return window(ir, at + 1, count);
 }
 
 // -- Hashing -----------------------------------------------------------------
@@ -544,6 +909,19 @@ const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first section: `magic` + `format_version`.
 const header_len = magic.len + @sizeOf(u32);
 
+/// Exact byte length of this IR's `serialize` output, computed without
+/// serializing, so a caller can size a buffer up front.
+pub fn serializedSize(ir: *const Ir) usize {
+    const per_node = @sizeOf(Node.Tag) + @sizeOf(Node.Data);
+    const per_var = @sizeOf(Variable.Id) + @sizeOf(Type) + @sizeOf(Variable.Kind);
+    const per_constraint = @sizeOf(Constraint.Id) + @sizeOf(Constraint.Flags) + @sizeOf(Extra.Slice);
+    return header_len + checksum_len +
+        4 + ir.nodes.len * per_node +
+        4 + ir.vars.len * per_var +
+        4 + ir.constraints.len * per_constraint +
+        4 + ir.extra.items.len * @sizeOf(u32);
+}
+
 /// Serialize into a freshly allocated byte buffer owned by the caller.
 pub fn serialize(ir: *const Ir, gpa: Allocator) Allocator.Error![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -586,10 +964,14 @@ pub const DeserializeError = error{
     ChecksumMismatch,
     /// Buffer ends mid-record.
     Truncated,
-} || Allocator.Error;
+} || ValidateError || Allocator.Error;
 
 /// Reconstruct an `Ir` from bytes produced by `serialize`. The result owns its
 /// storage and must be `deinit`ed.
+///
+/// The checksum is verified before any length is trusted, and the reconstructed
+/// IR is then run through `validate`, so a blob that survives both can be walked
+/// without bounds checks even if it was hostile.
 pub fn deserialize(gpa: Allocator, bytes: []const u8) DeserializeError!Ir {
     if (bytes.len < header_len + checksum_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
@@ -625,6 +1007,7 @@ pub fn deserialize(gpa: Allocator, bytes: []const u8) DeserializeError!Ir {
     try ir.extra.resize(gpa, try cur.readU32());
     try cur.copyInto(std.mem.sliceAsBytes(ir.extra.items));
 
+    try ir.validate(gpa);
     return ir;
 }
 
@@ -684,6 +1067,7 @@ test "build, hash, and round-trip a small constraint set" {
     // Serialize -> deserialize preserves structure and content hash.
     const bytes = try ir.serialize(gpa);
     defer gpa.free(bytes);
+    try std.testing.expectEqual(ir.serializedSize(), bytes.len);
 
     var ir2 = try Ir.deserialize(gpa, bytes);
     defer ir2.deinit(gpa);
@@ -740,6 +1124,121 @@ test "cache format is versioned and checksum-protected" {
     try std.testing.expectError(error.UnsupportedVersion, Ir.deserialize(gpa, &bad_version));
 }
 
+test "validate accepts what the builders produce, including structural nodes" {
+    const gpa = std.testing.allocator;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(8), .kind = .rand });
+    const y = try ir.addVariable(gpa, .{ .id = @enumFromInt(1), .ty = Type.bit(8), .kind = .rand });
+
+    // if (x == 3) y == 4;
+    const cond = try ir.binary(gpa, .eq, try ir.varRef(gpa, x), try ir.constInt(gpa, 3, Type.bit(8)));
+    const then = try ir.binary(gpa, .eq, try ir.varRef(gpa, y), try ir.constInt(gpa, 4, Type.bit(8)));
+    const conditional = try ir.ifElse(gpa, cond, then, .null);
+
+    // x dist { [0:7] :/ 10 };
+    const item = try ir.distItem(
+        gpa,
+        .eq,
+        try ir.range(gpa, try ir.constInt(gpa, 0, Type.bit(8)), try ir.constInt(gpa, 7, Type.bit(8))),
+        try ir.constInt(gpa, 10, Type.bit(8)),
+    );
+    const weighted = try ir.dist(gpa, try ir.varRef(gpa, x), &.{item});
+
+    const distinct = try ir.unique(gpa, &.{ try ir.varRef(gpa, x), try ir.varRef(gpa, y) });
+    const order = try ir.solveBefore(gpa, &.{x}, &.{y});
+
+    _ = try ir.addConstraint(gpa, @enumFromInt(9), .{ .soft = true }, &.{ conditional, weighted, distinct, order });
+    try ir.validate(gpa);
+
+    // And they survive a cache round-trip, which validates on the way back in.
+    const bytes = try ir.serialize(gpa);
+    defer gpa.free(bytes);
+    var ir2 = try Ir.deserialize(gpa, bytes);
+    defer ir2.deinit(gpa);
+    try std.testing.expectEqual(ir.hash(), ir2.hash());
+}
+
+test "validate rejects malformed IRs" {
+    const gpa = std.testing.allocator;
+
+    // An operand that refers forward (here, to the node itself and past the end)
+    // would make the forward-sweep evaluator read an unresolved value.
+    {
+        var ir: Ir = .{};
+        defer ir.deinit(gpa);
+        _ = try ir.addNode(gpa, .{ .tag = .add, .data = .{ .lhs = 0, .rhs = 1 } });
+        try std.testing.expectError(error.InvalidIr, ir.validate(gpa));
+    }
+
+    // A reference to a variable that was never declared.
+    {
+        var ir: Ir = .{};
+        defer ir.deinit(gpa);
+        _ = try ir.varRef(gpa, @enumFromInt(3));
+        try std.testing.expectError(error.InvalidIr, ir.validate(gpa));
+    }
+
+    // Operands of different widths, which the evaluator has no rule for.
+    {
+        var ir: Ir = .{};
+        defer ir.deinit(gpa);
+        const a = try ir.constInt(gpa, 1, Type.bit(4));
+        const b = try ir.constInt(gpa, 1, Type.bit(8));
+        _ = try ir.binary(gpa, .add, a, b);
+        try std.testing.expectError(error.InvalidIr, ir.validate(gpa));
+    }
+
+    // A constraint body pointing at a node that does not exist.
+    {
+        var ir: Ir = .{};
+        defer ir.deinit(gpa);
+        _ = try ir.addConstraint(gpa, @enumFromInt(0), .{}, &.{@enumFromInt(7)});
+        try std.testing.expectError(error.InvalidIr, ir.validate(gpa));
+    }
+}
+
+test "deserialize rejects a checksum-valid but malformed blob" {
+    const gpa = std.testing.allocator;
+
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+    _ = try ir.constInt(gpa, 1, Type.bit(8));
+
+    const bytes = try ir.serialize(gpa);
+    defer gpa.free(bytes);
+
+    const tampered = try gpa.dupe(u8, bytes);
+    defer gpa.free(tampered);
+
+    // Corrupt the first node's tag into one no build knows, then re-checksum so
+    // the blob passes the integrity check — validation is what has to catch it.
+    tampered[header_len + 4] = 254;
+    const payload = tampered[0 .. tampered.len - checksum_len];
+    var digest: Digest = undefined;
+    Blake3.hash(payload, &digest, .{});
+    @memcpy(tampered[tampered.len - checksum_len ..], &digest);
+
+    try std.testing.expectError(error.InvalidIr, Ir.deserialize(gpa, tampered));
+}
+
+test "constBits and constBig agree on the same magnitude" {
+    const gpa = std.testing.allocator;
+
+    var from_big: Ir = .{};
+    defer from_big.deinit(gpa);
+    var limbs = [_]std.math.big.Limb{ 0xdead_beef, 1 << 36 };
+    _ = try from_big.constBig(gpa, .{ .limbs = &limbs, .positive = true }, Type.bit(128));
+
+    var from_words: Ir = .{};
+    defer from_words.deinit(gpa);
+    _ = try from_words.constBits(gpa, &.{ 0xdead_beef, 1 << 36 }, Type.bit(128));
+
+    try std.testing.expectEqual(from_big.hash(), from_words.hash());
+}
+
 test "typeOf resolves recursively" {
     const gpa = std.testing.allocator;
 
@@ -756,6 +1255,13 @@ test "typeOf resolves recursively" {
     try std.testing.expectEqual(@as(u16, 16), ir.typeOf(wide).width);
     try std.testing.expectEqual(@as(u16, 8), ir.typeOf(back).width);
     try std.testing.expectEqual(@as(u16, 1), ir.typeOf(cmp).width);
+
+    // The linear sweep agrees with the recursive resolver, node for node.
+    const types = try ir.resolveTypes(gpa);
+    defer gpa.free(types);
+    for (types, 0..) |t, i| {
+        try std.testing.expectEqual(ir.typeOf(@enumFromInt(@as(u32, @intCast(i)))), t);
+    }
 }
 
 test "wide integer literal round-trips" {
