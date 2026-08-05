@@ -140,6 +140,11 @@ fn setInvalid(out: ?*u32) void {
     if (out) |o| o.* = invalid;
 }
 
+/// A `crv_node` is whatever `uint32_t` the caller passed, so turning one into a
+/// `Node.Index` is a partial function — hence the optional, not a defensive
+/// null check. It has to happen here: a builder only *stores* an operand index,
+/// so an out-of-range one is never dereferenced and no bounds check fires; the
+/// IR just becomes quietly malformed until `validate` rejects the whole thing.
 fn nodeIndex(ir: *const Ir, n: u32) ?Ir.Node.Index {
     if (n >= ir.nodes.len) return null;
     return @enumFromInt(n);
@@ -174,14 +179,14 @@ fn sliceOf(comptime T: type, ptr: ?[*]const T, len: usize) ?[]const T {
 /// Like `sliceOf`, but every element must name an existing node.
 fn nodeSlice(ir: *const Ir, ptr: ?[*]const u32, len: usize) ?[]const Ir.Node.Index {
     const raw = sliceOf(u32, ptr, len) orelse return null;
-    for (raw) |n| _ = nodeIndex(ir, n) orelse return null;
+    for (raw) |n| if (n >= ir.nodes.len) return null;
     return @ptrCast(raw);
 }
 
 /// Like `sliceOf`, but every element must name an existing variable.
 fn varSlice(ir: *const Ir, ptr: ?[*]const u32, len: usize) ?[]const Ir.Variable.Index {
     const raw = sliceOf(u32, ptr, len) orelse return null;
-    for (raw) |v| _ = varIndex(ir, v) orelse return null;
+    for (raw) |v| if (v >= ir.vars.len) return null;
     return @ptrCast(raw);
 }
 
