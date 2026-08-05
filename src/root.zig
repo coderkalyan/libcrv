@@ -11,6 +11,11 @@ pub const Ir = @import("Ir.zig");
 /// Standardized, swappable solver interface (type-erased pointer + vtable).
 pub const Solver = @import("Solver.zig");
 
+/// Solver-independent static analyses over the IR: which bits of each variable
+/// a constraint can actually observe, and which variables are pinned by the
+/// others. Any engine can use these to shrink what it has to reason about.
+pub const Analysis = @import("Analysis.zig");
+
 /// A rejection-sampling solver: draw random values, evaluate the IR, accept the
 /// first assignment that satisfies every constraint.
 pub const RejectionSampler = @import("RejectionSampler.zig");
