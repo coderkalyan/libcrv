@@ -201,10 +201,20 @@ lands.
 Every call returns a `crv_status` and writes its result through a trailing
 out-parameter (`NULL` to discard); negative statuses are hard errors, and
 `CRV_EXHAUSTED` from `crv_solver_next` is the budget running out, not a proof
-of unsatisfiability. Operators go through one `crv_node_binary(ir, CRV_OP_ADD,
-a, b, &out)` entry point rather than one export per operator, and the `crv_op`
-values are mapped to IR tags explicitly, so the internal tag ordering is free
-to change without breaking a compiled consumer.
+of unsatisfiability. Operators go through one `crv_node_binary(&ir, CRV_OP_ADD,
+a, b, &out)` entry point rather than one export per operator.
+
+`crv_op`, `crv_cast`, `crv_var_kind` and `crv_dist_kind` are declared with the
+IR's own enum values — `CRV_OP_ADD` *is* `Ir.Node.Tag.add` — so no table
+translates between a "wire" numbering and an internal one. Those values are
+fixed for the serialized format anyway, so the second numbering only ever bought
+the freedom to drift. `Node.Tag` is numbered in gapped classes (leaf, unary,
+binary, cast, set, structural) and `Tag.class` is the exhaustive switch that
+names them, which is what an incoming op code is checked against: passing
+`CRV_OP_ADD` to `crv_node_unary` is `CRV_ERR_INVALID_ARGUMENT`. A test
+translates the real `crv.h` and compares every member against the enum it must
+equal, building the C names from the Zig ones, so a tag that gains a class the C
+API exposes will not compile until the header declares it.
 
 The C layer adds no logic and no state of its own — it is argument checking plus
 a call into the Zig core — but it does check what Zig's type system would

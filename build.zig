@@ -21,6 +21,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // The header, translated to Zig, so `c_api.zig` can assert that `crv_op`
+    // and friends carry the IR's own enum values. This goes through a build
+    // step rather than `@cImport` because only a step makes `crv.h` a tracked
+    // input: an in-source `@cImport` is cached against the Zig files alone, so
+    // editing the header would leave the check reporting a stale pass.
+    const header = b.addTranslateC(.{
+        .root_source_file = b.path("include/crv.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_mod.addImport("crv.h", header.createModule());
 
     const static = b.addLibrary(.{
         .linkage = .static,

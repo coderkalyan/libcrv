@@ -202,12 +202,16 @@ crv_status crv_node_const_bits(crv_ir *ir, const uint64_t *words, size_t nwords,
  * operands' width, wrapped there. Widths change only through
  * `crv_node_cast` — to add two 4-bit values without wrapping, zero-extend
  * them first.
+ *
+ * These values are the library's own node tags, drawn from one numbering that
+ * also fixes the serialized format, so nothing is translated at the boundary
+ * and the gaps between the groups below are room for that numbering to grow.
  */
 typedef enum crv_op {
     /* Unary. */
-    CRV_OP_NEG = 1,  /* -a          */
-    CRV_OP_BNOT = 2, /* ~a          */
-    CRV_OP_LNOT = 3, /* !a          */
+    CRV_OP_NEG = 16,  /* -a          */
+    CRV_OP_BNOT = 17, /* ~a          */
+    CRV_OP_LNOT = 18, /* !a          */
 
     /* Binary, result width = operand width. */
     CRV_OP_ADD = 32,
@@ -242,9 +246,9 @@ typedef enum crv_op {
 } crv_op;
 
 typedef enum crv_cast {
-    CRV_CAST_ZEXT = 1,  /* zero-extend to a wider width       */
-    CRV_CAST_SEXT = 2,  /* sign-extend to a wider width       */
-    CRV_CAST_TRUNC = 3  /* truncate, keeping the low bits     */
+    CRV_CAST_ZEXT = 96,  /* zero-extend to a wider width       */
+    CRV_CAST_SEXT = 97,  /* sign-extend to a wider width       */
+    CRV_CAST_TRUNC = 98  /* truncate, keeping the low bits     */
 } crv_cast;
 
 /* Arity is checked: a binary op passed to `crv_node_unary` (or the reverse)

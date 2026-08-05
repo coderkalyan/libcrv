@@ -11,8 +11,11 @@
 //! get the same representation, the same costs, and the same hazards — in
 //! particular, mutating an IR a solver is bound to is undefined for both.
 //!
-//! The enum values crossing the ABI are mapped explicitly, never cast, so the
-//! IR's internal tag ordering can change without breaking a compiled consumer.
+//! The enums crossing the ABI follow the same rule. `crv_op`, `crv_cast`,
+//! `crv_var_kind` and `crv_dist_kind` are declared in `crv.h` with the IR's own
+//! values, which are fixed for the on-disk format anyway, so an argument is
+//! decoded and range-checked rather than translated through a table that could
+//! drift out of step with either side.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -182,87 +185,18 @@ fn varSlice(ir: *const Ir, ptr: ?[*]const u32, len: usize) ?[]const Ir.Variable.
     return @ptrCast(raw);
 }
 
-// -- ABI mappings ------------------------------------------------------------
+// -- ABI decoding ------------------------------------------------------------
 //
-// Explicit both ways: the wire values in `crv.h` are fixed, the IR's tags are
-// free to move.
+// There is one numbering, not two: `crv_op`, `crv_cast`, `crv_var_kind` and
+// `crv_dist_kind` are declared in `crv.h` with the IR's own enum values, so
+// nothing here translates. What is left is the check C cannot make — that the
+// integer names a member at all, and that it names one this entry point takes.
 
-fn varKind(raw: c_int) ?Ir.Variable.Kind {
-    return switch (raw) {
-        0 => .state,
-        1 => .rand,
-        2 => .randc,
-        else => null,
-    };
-}
-
-fn varKindValue(kind: Ir.Variable.Kind) u8 {
-    return switch (kind) {
-        .state => 0,
-        .rand => 1,
-        .randc => 2,
-    };
-}
-
-fn unaryTag(raw: c_int) ?Ir.Node.Tag {
-    return switch (raw) {
-        1 => .neg,
-        2 => .bnot,
-        3 => .lnot,
-        else => null,
-    };
-}
-
-fn binaryTag(raw: c_int) ?Ir.Node.Tag {
-    return switch (raw) {
-        32 => .add,
-        33 => .sub,
-        34 => .mul,
-        35 => .sdiv,
-        36 => .udiv,
-        37 => .smod,
-        38 => .umod,
-        39 => .band,
-        40 => .bor,
-        41 => .bxor,
-        42 => .sll,
-        43 => .srl,
-        44 => .sra,
-        64 => .eq,
-        65 => .ne,
-        66 => .slt,
-        67 => .ult,
-        68 => .sle,
-        69 => .ule,
-        70 => .sgt,
-        71 => .ugt,
-        72 => .sge,
-        73 => .uge,
-        74 => .land,
-        75 => .lor,
-        76 => .implies,
-        77 => .iff,
-        else => null,
-    };
-}
-
-const Cast = enum { zext, sext, trunc };
-
-fn castKind(raw: c_int) ?Cast {
-    return switch (raw) {
-        1 => .zext,
-        2 => .sext,
-        3 => .trunc,
-        else => null,
-    };
-}
-
-fn distKind(raw: c_int) ?Ir.DistKind {
-    return switch (raw) {
-        0 => .eq,
-        1 => .div,
-        else => null,
-    };
+/// Decode an operator code into the tag it is defined to equal, accepting only
+/// the class the calling export is documented to build.
+fn tagIn(raw: c_int, class: Ir.Node.Tag.Class) ?Ir.Node.Tag {
+    const tag = std.enums.fromInt(Ir.Node.Tag, raw) orelse return null;
+    return if (tag.class() == class) tag else null;
 }
 
 // -- IR lifetime -------------------------------------------------------------
@@ -309,7 +243,7 @@ export fn crv_var_add(handle: ?*Ir, id: u32, width: u16, kind: c_int, out: ?*u32
     setInvalid(out);
     const ir = handle orelse return .err_invalid_argument;
     if (width == 0) return .err_invalid_argument;
-    const k = varKind(kind) orelse return .err_invalid_argument;
+    const k = std.enums.fromInt(Ir.Variable.Kind, kind) orelse return .err_invalid_argument;
 
     const v = ir.addVariable(gpa, .{
         .id = @enumFromInt(id),
@@ -333,7 +267,7 @@ export fn crv_var_get(handle: ?*const Ir, v: u32, out: ?*VarInfo) Status {
     if (out) |o| o.* = .{
         .id = @intFromEnum(ir.vars.items(.id)[i]),
         .width = ir.vars.items(.ty)[i].width,
-        .kind = varKindValue(ir.vars.items(.kind)[i]),
+        .kind = @intFromEnum(ir.vars.items(.kind)[i]),
         .reserved = 0,
     };
     return .ok;
@@ -380,7 +314,7 @@ export fn crv_node_const_bits(
 export fn crv_node_unary(handle: ?*Ir, op: c_int, a: u32, out: ?*u32) Status {
     setInvalid(out);
     const ir = handle orelse return .err_invalid_argument;
-    const tag = unaryTag(op) orelse return .err_invalid_argument;
+    const tag = tagIn(op, .unary) orelse return .err_invalid_argument;
     const operand = nodeIndex(ir, a) orelse return .err_invalid_argument;
     return emit(out, ir.unary(gpa, tag, operand));
 }
@@ -388,7 +322,7 @@ export fn crv_node_unary(handle: ?*Ir, op: c_int, a: u32, out: ?*u32) Status {
 export fn crv_node_binary(handle: ?*Ir, op: c_int, a: u32, b: u32, out: ?*u32) Status {
     setInvalid(out);
     const ir = handle orelse return .err_invalid_argument;
-    const tag = binaryTag(op) orelse return .err_invalid_argument;
+    const tag = tagIn(op, .binary) orelse return .err_invalid_argument;
     const lhs = nodeIndex(ir, a) orelse return .err_invalid_argument;
     const rhs = nodeIndex(ir, b) orelse return .err_invalid_argument;
     if (Ir.requiresEqualWidths(tag) and widthOf(ir, lhs) != widthOf(ir, rhs)) {
@@ -400,13 +334,14 @@ export fn crv_node_binary(handle: ?*Ir, op: c_int, a: u32, b: u32, out: ?*u32) S
 export fn crv_node_cast(handle: ?*Ir, cast: c_int, a: u32, width: u16, out: ?*u32) Status {
     setInvalid(out);
     const ir = handle orelse return .err_invalid_argument;
-    const kind = castKind(cast) orelse return .err_invalid_argument;
+    const tag = tagIn(cast, .cast) orelse return .err_invalid_argument;
     const operand = nodeIndex(ir, a) orelse return .err_invalid_argument;
     if (width == 0) return .err_invalid_argument;
-    return emit(out, switch (kind) {
+    return emit(out, switch (tag) {
         .zext => ir.zext(gpa, operand, width),
         .sext => ir.sext(gpa, operand, width),
         .trunc => ir.trunc(gpa, operand, width),
+        else => unreachable, // `.cast` is exactly these three.
     });
 }
 
@@ -455,7 +390,7 @@ export fn crv_node_dist_item(
 ) Status {
     setInvalid(out);
     const ir = handle orelse return .err_invalid_argument;
-    const k = distKind(kind) orelse return .err_invalid_argument;
+    const k = std.enums.fromInt(Ir.DistKind, kind) orelse return .err_invalid_argument;
     const v = nodeIndex(ir, value) orelse return .err_invalid_argument;
     const w = nodeIndex(ir, weight) orelse return .err_invalid_argument;
     return emit(out, ir.distItem(gpa, k, v, w));
@@ -706,6 +641,59 @@ export fn crv_solver_stats(handle: ?*const CSolver, out: ?*Stats) Status {
 // End-to-end coverage lives in `test/smoke.c`, which exercises the real header
 // from real C. These cover the paths a well-behaved C program does not reach.
 
+/// What a C caller writes as `CRV_OP_ADD` or `CRV_CAST_ZEXT`. The header holds
+/// the same numbers; `crv_header_values` is what proves it.
+fn code(tag: Ir.Node.Tag) c_int {
+    return @intFromEnum(tag);
+}
+
+fn kindCode(kind: Ir.Variable.Kind) c_int {
+    return @intFromEnum(kind);
+}
+
+fn shout(comptime name: []const u8) []const u8 {
+    comptime {
+        var out: [name.len]u8 = undefined;
+        for (name, &out) |ch, *o| o.* = std.ascii.toUpper(ch);
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+// The claim the whole boundary rests on, checked against the real header
+// rather than by eye. Names are built rather than listed, so a tag added to a
+// class the C API exposes fails to compile here until `crv.h` declares it.
+test "crv.h declares the IR's own enum values" {
+    const c = @import("crv.h");
+
+    inline for (comptime std.enums.values(Ir.Node.Tag)) |tag| {
+        const prefix = switch (comptime tag.class()) {
+            .unary, .binary => "CRV_OP_",
+            .cast => "CRV_CAST_",
+            // Everything else has a builder of its own, not an op code.
+            .leaf, .set, .structural => continue,
+        };
+        try std.testing.expectEqual(
+            @as(i64, @intFromEnum(tag)),
+            @as(i64, @field(c, prefix ++ shout(@tagName(tag)))),
+        );
+    }
+
+    inline for (comptime std.enums.values(Ir.Variable.Kind)) |kind| {
+        try std.testing.expectEqual(
+            @as(i64, @intFromEnum(kind)),
+            @as(i64, @field(c, "CRV_VAR_" ++ shout(@tagName(kind)))),
+        );
+    }
+
+    inline for (comptime std.enums.values(Ir.DistKind)) |kind| {
+        try std.testing.expectEqual(
+            @as(i64, @intFromEnum(kind)),
+            @as(i64, @field(c, "CRV_DIST_" ++ shout(@tagName(kind)))),
+        );
+    }
+}
+
 test "builders reject bad handles, indices, and widths" {
     var ir: Ir = undefined;
     crv_ir_init(&ir);
@@ -716,24 +704,26 @@ test "builders reject bad handles, indices, and widths" {
     try std.testing.expectEqual(invalid, node);
 
     // An index no node has, an op code that decodes to nothing, and a zero width.
-    try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, 1, 7, &node));
+    try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, code(.neg), 7, &node));
     try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, 999, 0, &node));
     try std.testing.expectEqual(Status.err_invalid_argument, crv_node_const_u64(&ir, 1, 0, &node));
 
-    // Arity is part of the op: a binary op is not a unary one.
+    // Class is part of the op: a binary op, or a tag no builder exposes, is
+    // not a unary one.
     var a: u32 = 0;
     try std.testing.expectEqual(Status.ok, crv_node_const_u64(&ir, 1, 8, &a));
-    try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, 32, a, &node));
+    try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, code(.add), a, &node));
+    try std.testing.expectEqual(Status.err_invalid_argument, crv_node_unary(&ir, code(.var_ref), a, &node));
 
     // Widths must agree where the evaluator assumes they do.
     var b: u32 = 0;
     try std.testing.expectEqual(Status.ok, crv_node_const_u64(&ir, 1, 4, &b));
-    try std.testing.expectEqual(Status.err_width_mismatch, crv_node_binary(&ir, 32, a, b, &node));
+    try std.testing.expectEqual(Status.err_width_mismatch, crv_node_binary(&ir, code(.add), a, b, &node));
 
     // ... and a cast is how you make them agree.
     var widened: u32 = 0;
-    try std.testing.expectEqual(Status.ok, crv_node_cast(&ir, 1, b, 8, &widened));
-    try std.testing.expectEqual(Status.ok, crv_node_binary(&ir, 32, a, widened, &node));
+    try std.testing.expectEqual(Status.ok, crv_node_cast(&ir, code(.zext), b, 8, &widened));
+    try std.testing.expectEqual(Status.ok, crv_node_binary(&ir, code(.add), a, widened, &node));
 
     var width: u16 = 0;
     try std.testing.expectEqual(Status.ok, crv_node_width(&ir, node, &width));
@@ -749,10 +739,10 @@ test "solutions come back through a caller-sized buffer" {
     var ref: u32 = 0;
     var lit: u32 = 0;
     var eq: u32 = 0;
-    try std.testing.expectEqual(Status.ok, crv_var_add(&ir, 1, 6, 1, &x));
+    try std.testing.expectEqual(Status.ok, crv_var_add(&ir, 1, 6, kindCode(.rand), &x));
     try std.testing.expectEqual(Status.ok, crv_node_var(&ir, x, &ref));
     try std.testing.expectEqual(Status.ok, crv_node_const_u64(&ir, 42, 6, &lit));
-    try std.testing.expectEqual(Status.ok, crv_node_binary(&ir, 64, ref, lit, &eq));
+    try std.testing.expectEqual(Status.ok, crv_node_binary(&ir, code(.eq), ref, lit, &eq));
     const body = [_]u32{eq};
     try std.testing.expectEqual(Status.ok, crv_constraint_add(&ir, 0, 0, &body, 1, null));
 
@@ -778,7 +768,7 @@ test "a solver refuses an IR it cannot evaluate" {
     var x: u32 = 0;
     var ref: u32 = 0;
     var distinct: u32 = 0;
-    try std.testing.expectEqual(Status.ok, crv_var_add(&ir, 1, 4, 1, &x));
+    try std.testing.expectEqual(Status.ok, crv_var_add(&ir, 1, 4, kindCode(.rand), &x));
     try std.testing.expectEqual(Status.ok, crv_node_var(&ir, x, &ref));
     const members = [_]u32{ref};
     try std.testing.expectEqual(Status.ok, crv_node_unique(&ir, &members, 1, &distinct));

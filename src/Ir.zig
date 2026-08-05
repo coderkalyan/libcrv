@@ -90,107 +90,162 @@ pub const Node = struct {
         rhs: u32 = 0,
     };
 
+    /// What a node is. The numeric values are deliberate and load-bearing in
+    /// two places: they are the on-disk encoding (so changing one is a
+    /// `format_version` bump), and `crv.h` declares `crv_op` and `crv_cast`
+    /// with exactly these values, so the C bindings decode an operator by
+    /// checking which `Class` it lands in rather than by translating it
+    /// through a table. Tags are numbered in gapped groups to leave each class
+    /// room to grow; `0` is left unused, so a zeroed byte is never a valid tag.
     pub const Tag = enum(u8) {
-        // -- Leaves --
+        // -- Leaves: 1..15 --
         /// Typed integer literal. `lhs` = `extra` index of `[nwords, word0,
         /// word1, ...]`: a `u32` little-endian magnitude of `nwords` words
         /// (`ceil(width / 32)`, masked to the width), length-prefixed so a
         /// literal of any width is stored inline. `rhs` = packed `Type` (the
         /// literal's width).
-        int_literal,
+        int_literal = 1,
         /// Boolean literal (a 1-bit unsigned value). `lhs` is 0 or 1.
-        bool_literal,
+        bool_literal = 2,
         /// Reference to a declared variable. `lhs` = `Variable.Index`; its type
         /// is the variable's type.
-        var_ref,
+        var_ref = 3,
 
-        // -- Unary: `lhs` = operand node --
+        // -- Unary: 16..31. `lhs` = operand node --
         /// Arithmetic negation (`-a`).
-        neg,
+        neg = 16,
         /// Bitwise complement (`~a`).
-        bnot,
+        bnot = 17,
         /// Logical negation (`!a`).
-        lnot,
+        lnot = 18,
 
-        // -- Binary: `lhs`, `rhs` = operand nodes. Types are just widths, so
-        //    operators that depend on signedness come in signed (`s`) and
-        //    unsigned (`u`) forms. --
-        add,
-        sub,
-        mul,
-        sdiv,
-        udiv,
-        smod,
-        umod,
-        band,
-        bor,
-        bxor,
+        // -- Binary, result width = operand width: 32..63. `lhs`, `rhs` =
+        //    operand nodes. Types are just widths, so operators that depend on
+        //    signedness come in signed (`s`) and unsigned (`u`) forms. --
+        add = 32,
+        sub = 33,
+        mul = 34,
+        sdiv = 35,
+        udiv = 36,
+        smod = 37,
+        umod = 38,
+        band = 39,
+        bor = 40,
+        bxor = 41,
         /// Shift left (logical).
-        sll,
+        sll = 42,
         /// Shift right logical (zero-filling).
-        srl,
+        srl = 43,
         /// Shift right arithmetic (sign-extending).
-        sra,
-        eq,
-        ne,
-        slt,
-        ult,
-        sle,
-        ule,
-        sgt,
-        ugt,
-        sge,
-        uge,
-        land,
-        lor,
-        /// Implication (`a -> b`).
-        implies,
-        /// Equivalence (`a <-> b`).
-        iff,
+        sra = 44,
 
-        // -- Sets, ranges, distributions --
+        // -- Binary, 1-bit result: 64..95 --
+        eq = 64,
+        ne = 65,
+        slt = 66,
+        ult = 67,
+        sle = 68,
+        ule = 69,
+        sgt = 70,
+        ugt = 71,
+        sge = 72,
+        uge = 73,
+        land = 74,
+        lor = 75,
+        /// Implication (`a -> b`).
+        implies = 76,
+        /// Equivalence (`a <-> b`).
+        iff = 77,
+
+        // -- Sizing casts: 96..111. `lhs` = operand node, `rhs` = target bit
+        //    width. Widths only ever change through these; all other operators
+        //    keep their operands' width. --
+        /// Zero-extend to a wider, unsigned type.
+        zext = 96,
+        /// Sign-extend to a wider, signed type.
+        sext = 97,
+        /// Truncate to a narrower type, keeping the low bits.
+        trunc = 98,
+
+        // -- Sets, ranges, distributions: 112..127 --
         /// Inclusive range `[lo:hi]`. `lhs` = low node, `rhs` = high node.
         /// Appears as a member of `in`/`dist`, not as a boolean on its own.
-        range,
+        range = 112,
         /// Set membership — SystemVerilog `value inside { ... }`. `lhs` = value
         /// node, `rhs` = `extra` index of `[count, member0, member1, ...]` where
         /// each member is a value node or a `range` node.
-        in,
+        in = 113,
         /// Distribution `value dist { ... }`. `lhs` = value node,
         /// `rhs` = `extra` index of `[count, item0, ...]` of `dist_*` nodes.
-        dist,
+        dist = 114,
         /// `dist` item with `:=` weighting. `lhs` = value/`range` node,
         /// `rhs` = weight node.
-        dist_weight_eq,
+        dist_weight_eq = 115,
         /// `dist` item with `:/` weighting (weight split across the range).
-        dist_weight_div,
+        dist_weight_div = 116,
 
-        // -- Structural constraints --
+        // -- Structural constraints: 128..143 --
         /// `if (cond) then else else`. `lhs` = cond node,
         /// `rhs` = `extra` index of `[then_node, else_node]`; `else_node` is a
         /// `Node.Index` whose `.null` variant means there is no `else`.
-        if_else,
+        if_else = 128,
         /// `unique { ... }`. `lhs` = `extra` index of `[count, node0, ...]`.
-        unique,
+        unique = 129,
         /// `solve a, b before c, d`. `lhs` = `extra` index of
         /// `[before_count, before..., after_count, after...]`, each entry a
         /// `Variable.Index`. An ordering hint, not a boolean.
-        solve_before,
+        solve_before = 130,
         /// `foreach (arr[i]) body` — array iteration. `lhs` = array
         /// `Variable.Index`, `rhs` = `extra` index of
         /// `[iter_var, body_count, body...]`. Roadmap: arrays are not modeled
         /// past this stub.
-        foreach,
+        foreach = 131,
 
-        // -- Sizing casts: `lhs` = operand node, `rhs` = target bit width.
-        //    Widths only ever change through these; all other operators keep
-        //    their operands' width. --
-        /// Zero-extend to a wider, unsigned type.
-        zext,
-        /// Sign-extend to a wider, signed type.
-        sext,
-        /// Truncate to a narrower type, keeping the low bits.
-        trunc,
+        /// The family a tag belongs to. The numbering above groups tags this
+        /// way already, but `class` is the authority — it is exhaustive, so a
+        /// new tag cannot be added without placing itself.
+        pub const Class = enum { leaf, unary, binary, cast, set, structural };
+
+        /// Which entry point builds this tag. The C bindings use it to accept
+        /// only the operators a given export is documented to take: a binary
+        /// op handed to `crv_node_unary` is rejected here.
+        pub fn class(tag: Tag) Class {
+            return switch (tag) {
+                .int_literal, .bool_literal, .var_ref => .leaf,
+                .neg, .bnot, .lnot => .unary,
+                .add,
+                .sub,
+                .mul,
+                .sdiv,
+                .udiv,
+                .smod,
+                .umod,
+                .band,
+                .bor,
+                .bxor,
+                .sll,
+                .srl,
+                .sra,
+                .eq,
+                .ne,
+                .slt,
+                .ult,
+                .sle,
+                .ule,
+                .sgt,
+                .ugt,
+                .sge,
+                .uge,
+                .land,
+                .lor,
+                .implies,
+                .iff,
+                => .binary,
+                .zext, .sext, .trunc => .cast,
+                .range, .in, .dist, .dist_weight_eq, .dist_weight_div => .set,
+                .if_else, .unique, .solve_before, .foreach => .structural,
+            };
+        }
     };
 };
 
@@ -213,13 +268,15 @@ pub const Variable = struct {
     /// builder's own symbol table. The IR stores no text.
     pub const Id = enum(u32) { _ };
 
+    /// Like `Node.Tag`, the values are the on-disk encoding and are what
+    /// `crv.h` declares `crv_var_kind` with.
     pub const Kind = enum(u8) {
         /// Fixed input the solver may read but not assign.
-        state,
+        state = 0,
         /// Randomized each solve.
-        rand,
+        rand = 1,
         /// Randomized cyclically (`randc`): every value before repeats.
-        randc,
+        randc = 2,
     };
 };
 
@@ -437,7 +494,10 @@ pub fn in(ir: *Ir, gpa: Allocator, value: Node.Index, members: []const Node.Inde
     return ir.addNode(gpa, .{ .tag = .in, .data = .{ .lhs = @intFromEnum(value), .rhs = start } });
 }
 
-pub const DistKind = enum { eq, div };
+/// Which weighting a `dist` item uses. Not stored — `distItem` folds it into
+/// the node's tag — but the values are what `crv.h` declares `crv_dist_kind`
+/// with, so the C binding decodes one instead of translating it.
+pub const DistKind = enum(u8) { eq = 0, div = 1 };
 
 /// One weighted item of a `dist`: `value := weight` (`.eq`) or `value :/ weight`
 /// (`.div`, the weight split across the range). `value` is a value node or a
@@ -902,8 +962,9 @@ pub fn hash(ir: *const Ir) Digest {
 
 /// Identifies a libcrv cache blob.
 pub const magic: [4]u8 = .{ 'C', 'R', 'V', 'B' };
-/// On-disk format version. Bump on any layout change; readers reject mismatches.
-pub const format_version: u32 = 3;
+/// On-disk format version. Bump on any layout change — including a change to
+/// a stored enum's numeric values; readers reject mismatches.
+pub const format_version: u32 = 4;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first section: `magic` + `format_version`.
