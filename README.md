@@ -142,6 +142,96 @@ expression subset (arithmetic/bitwise/shift, comparisons, logical ops,
 `in`/`range`) and tracks cumulative `attempts`/`hits` counters; evaluating an unsupported node
 (`dist` or the structural constraints) panics for now.
 
+### The BDD engine
+
+`crv.BddSolver` compiles the whole constraint set into a reduced ordered binary
+decision diagram once, then draws from it. The cost model inverts: setup is
+expensive, and every draw afterwards is a single root-to-leaf walk that
+allocates nothing and **cannot fail**.
+
+```zig
+var bdd = try crv.BddSolver.init(gpa, &ir, .{ .seed = 0 });
+defer bdd.deinit(gpa);
+
+if (bdd.isUnsat()) return error.Contradiction; // decided, not "gave up"
+std.debug.print("{d} legal stimuli\n", .{@exp2(bdd.log2Count())});
+
+var out: [1]crv.Solver.Value = undefined;
+_ = bdd.next(&out); // exactly uniform over the solution set
+```
+
+Three things follow from having the whole solution set in hand, none of which a
+sampler can offer at any price:
+
+- **Exactly uniform** draws, however sparse the solution space. A rejection
+  sampler that accepts one draw in 2³² is not slow, it is broken.
+- **Unsatisfiability is decided.** `next` returns `false` only when no
+  assignment exists — a contradiction in your constraints is a diagnosis, not a
+  timeout.
+- **The solution count is exact** (`log2Count`), which is a coverage
+  measurement rather than a solver statistic.
+
+Measured on a 32-bit address constrained to a 4 KiB window *and* 64-byte
+aligned — 64 solutions out of 2³², where `RejectionSampler` accepts about one
+draw in 67 million and gives up:
+
+| Constraint set | Build | Per draw |
+| --- | --- | --- |
+| Windowed + aligned 32-bit address | 0.35 ms | 150 ns |
+| `x + y == z`, three 32-bit variables | 0.5 ms | 620 ns |
+| `x % 64 == 0`, 32-bit (power of two → wiring) | 0.5 ms | 50 ns |
+| `x % 100 == 7`, 32-bit (restoring division array) | 18 ms | 190 ns |
+| `x << s == 256`, 32-bit variable shift | 0.5 ms | 190 ns |
+| 64 independent 32-bit range constraints | 3 ms | 10.3 µs |
+
+Four decisions carry that performance:
+
+1. **Variable ordering** (`src/bdd/order.zig`) is significance-major and
+   most-significant-first, interleaving the bits of variables that interact.
+   `x + y == z` is linear under this order and *exponential* if each variable's
+   bits are kept contiguous. This is not a tuning knob; without it the engine
+   does not work. One exception rides above it: a variable used only as a shift
+   amount is hoisted ahead of the value bits, because an amount is a selector
+   rather than a datum — deciding it first collapses each branch to a fixed
+   wiring of the operand.
+2. **Partitioning** (`src/Partition.zig`) splits the constraints into
+   independent components and solves each separately. Sampling them
+   independently is exact — independence is what a component boundary means —
+   and it scopes the expensive step to the largest island rather than the whole
+   set.
+3. **Model counting in log space.** Variables may be 65535 bits wide, so counts
+   reach 2^65535; counts are kept as `log2` and converted once, at build time,
+   into integer branch thresholds, so the sampling loop touches no floating
+   point.
+4. **No garbage collector.** Each component builds into a bump-allocated
+   manager and is then frozen out into a compact read-only graph, after which
+   the manager is reset in constant time. Collecting would mark nearly every
+   node and sweep almost nothing.
+
+`init` fails, loudly, rather than degrading:
+
+| Error | Cause |
+| --- | --- |
+| `NodeBudgetExceeded` | the diagram outgrew `node_budget` (default 2²¹ nodes) |
+| `TooManyBits` | one component spans more than `max_levels` random bits |
+| `OperandTooWide` | variable-by-variable multiply/divide above `max_mul_width` |
+| `UnsupportedNode` | `dist`, `solve_before`, or `foreach` |
+
+`OperandTooWide` is a consequence of a theorem, not a missing optimization:
+Bryant proved in 1991 that `x * y == z` has BDD size ≥ 2^(n/8) under *every*
+variable order. Narrow multiplies are genuinely cheap and are compiled; wide
+ones are hopeless and say so. Choosing a different engine on failure is the
+caller's decision — a hybrid that degrades gracefully belongs behind its own
+`Solver` implementation, not hidden inside this one.
+
+Scope matches the rejection sampler plus `if_else` and `unique`. As there, and
+so the two engines agree, `soft` constraint flags are treated as hard and
+`randc` variables as plain `rand`. The engines are cross-checked against each
+other: a differential test builds the same IR for both and compares their
+*solution sets* exactly, which is what pins down the operator edge cases
+(division by zero, `sra`'s sign width, saturating shift amounts, truncating
+signed division).
+
 ## Layout
 
 ```
@@ -149,9 +239,19 @@ build.zig                # build graph: module, static library, test step
 build.zig.zon            # package manifest (name, version, dependencies)
 src/root.zig             # library root — the public API
 src/Ir.zig               # the flattened-tree IR
+src/Partition.zig        # splits constraints into independent sub-problems
 src/Solver.zig           # the swappable solver interface
 src/RejectionSampler.zig # the rejection-sampling engine
+src/BddSolver.zig        # the BDD engine
+src/bdd/Manager.zig      #   ROBDD package (unique table, ITE, complement edges)
+src/bdd/order.zig        #   variable ordering: IR variable bits -> BDD levels
+src/bdd/blast.zig        #   bit-blaster: IR expressions -> BDDs
+src/bdd/sample.zig       #   model counting and uniform sampling
 ```
+
+`Partition` sits outside `src/bdd/` on purpose: decomposing a constraint set
+into independent sub-problems is useful to any engine, not just this one.
+Bit-level ordering is BDD-specific and stays with it.
 
 ## License
 

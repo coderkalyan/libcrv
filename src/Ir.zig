@@ -125,11 +125,14 @@ pub const Node = struct {
         band,
         bor,
         bxor,
-        /// Shift left (logical).
+        /// Shift left (logical). `rhs` is a shift *amount*, not a value of the
+        /// shifted operand's type, so it carries its own width — see
+        /// `shiftAmountWidth`.
         sll,
-        /// Shift right logical (zero-filling).
+        /// Shift right logical (zero-filling). See `sll` for the amount's width.
         srl,
-        /// Shift right arithmetic (sign-extending).
+        /// Shift right arithmetic (sign-extending). See `sll` for the amount's
+        /// width.
         sra,
         eq,
         ne,
@@ -449,6 +452,22 @@ pub fn castWidth(ir: *const Ir, node: Node.Index) u16 {
 /// Width assumed for a variable declared without an explicit one.
 pub const default_width: u16 = 32;
 
+/// The width a shift amount must have to shift a `width`-bit value.
+///
+/// Unlike the operands of an arithmetic or relational operator, which all share
+/// the node's one type, a shift amount is a *count*. It therefore carries its
+/// own width: exactly the `ceil(log2(width))` bits needed to express every
+/// in-range shift, and at least one.
+///
+/// Sizing it this way is what makes an out-of-range shift *unrepresentable*
+/// whenever `width` is a power of two — the common case — so a consumer can
+/// drop its saturation handling entirely there rather than emitting a bounds
+/// check that can never fire.
+pub fn shiftAmountWidth(width: u16) u16 {
+    if (width <= 2) return 1;
+    return std.math.log2_int_ceil(u16, width);
+}
+
 /// Recursively resolve a node's type — its bit-vector width. Leaves, literals,
 /// and casts are explicitly typed; every other operator propagates its left
 /// operand's width, and comparisons/logical operators yield a 1-bit `bool`.
@@ -474,6 +493,107 @@ pub fn typeOf(ir: *const Ir, node: Node.Index) Type {
 
 fn varType(t: Type) Type {
     return if (t.width == 0) .{ .width = default_width } else t;
+}
+
+/// A direct edge out of a node: either an operand node or a named variable.
+pub const Child = union(enum) {
+    node: Node.Index,
+    variable: Variable.Index,
+};
+
+/// Visit every direct edge out of `node` — the operand nodes it reads and the
+/// variables it names — in unspecified order. The variable-arity payloads in
+/// `extra` are decoded here, per tag, so that callers (partitioning,
+/// reachability marking, bit-blasting) need no per-tag knowledge of their own
+/// and cannot drift from the encoding documented on `Node.Tag`.
+///
+/// An absent edge (a missing `else`) is simply not visited.
+pub fn forEachChild(
+    ir: *const Ir,
+    node: Node.Index,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), Child) void,
+) void {
+    const i = @intFromEnum(node);
+    const d = ir.nodes.items(.data)[i];
+    const e = ir.extra.items;
+
+    switch (ir.nodes.items(.tag)[i]) {
+        // Leaves: the literal payload in `extra` is a magnitude, not an edge.
+        .int_literal, .bool_literal => {},
+        .var_ref => f(ctx, .{ .variable = @enumFromInt(d.lhs) }),
+
+        .neg, .bnot, .lnot, .zext, .sext, .trunc => f(ctx, .{ .node = @enumFromInt(d.lhs) }),
+
+        .add,
+        .sub,
+        .mul,
+        .sdiv,
+        .udiv,
+        .smod,
+        .umod,
+        .band,
+        .bor,
+        .bxor,
+        .sll,
+        .srl,
+        .sra,
+        .eq,
+        .ne,
+        .slt,
+        .ult,
+        .sle,
+        .ule,
+        .sgt,
+        .ugt,
+        .sge,
+        .uge,
+        .land,
+        .lor,
+        .implies,
+        .iff,
+        .range,
+        .dist_weight_eq,
+        .dist_weight_div,
+        => {
+            f(ctx, .{ .node = @enumFromInt(d.lhs) });
+            f(ctx, .{ .node = @enumFromInt(d.rhs) });
+        },
+
+        // Value node plus a counted member list in `extra`.
+        .in, .dist => {
+            f(ctx, .{ .node = @enumFromInt(d.lhs) });
+            for (e[d.rhs + 1 ..][0..e[d.rhs]]) |m| f(ctx, .{ .node = @enumFromInt(m) });
+        },
+
+        // Condition plus `[then, else]`; `else` may be the `null` sentinel.
+        .if_else => {
+            f(ctx, .{ .node = @enumFromInt(d.lhs) });
+            const then_node: Node.Index = @enumFromInt(e[d.rhs]);
+            const else_node: Node.Index = @enumFromInt(e[d.rhs + 1]);
+            f(ctx, .{ .node = then_node });
+            if (else_node != .null) f(ctx, .{ .node = else_node });
+        },
+
+        .unique => {
+            for (e[d.lhs + 1 ..][0..e[d.lhs]]) |m| f(ctx, .{ .node = @enumFromInt(m) });
+        },
+
+        // `[before_count, before..., after_count, after...]`, all variables.
+        .solve_before => {
+            const before_len = e[d.lhs];
+            for (e[d.lhs + 1 ..][0..before_len]) |v| f(ctx, .{ .variable = @enumFromInt(v) });
+            const after = d.lhs + 1 + before_len;
+            for (e[after + 1 ..][0..e[after]]) |v| f(ctx, .{ .variable = @enumFromInt(v) });
+        },
+
+        // Array variable, then `[iter_var, body_count, body...]`.
+        .foreach => {
+            f(ctx, .{ .variable = @enumFromInt(d.lhs) });
+            f(ctx, .{ .variable = @enumFromInt(e[d.rhs]) });
+            for (e[d.rhs + 2 ..][0..e[d.rhs + 1]]) |m| f(ctx, .{ .node = @enumFromInt(m) });
+        },
+    }
 }
 
 /// The statement nodes making up a constraint block's body.
@@ -783,6 +903,36 @@ test "wide integer literal round-trips" {
     var over = [_]std.math.big.Limb{ 1, 0, 1 };
     const truncated = try ir.constBig(gpa, .{ .limbs = &over, .positive = true }, Type.bit(128));
     try std.testing.expectEqual(@as(u64, 1), ir.intValue(truncated));
+}
+
+test "a shift amount is sized to span exactly the in-range shifts" {
+    // Enough bits to express `width - 1`, and never more.
+    try std.testing.expectEqual(@as(u16, 1), shiftAmountWidth(1));
+    try std.testing.expectEqual(@as(u16, 1), shiftAmountWidth(2));
+    try std.testing.expectEqual(@as(u16, 2), shiftAmountWidth(3));
+    try std.testing.expectEqual(@as(u16, 2), shiftAmountWidth(4));
+    try std.testing.expectEqual(@as(u16, 3), shiftAmountWidth(5));
+    try std.testing.expectEqual(@as(u16, 3), shiftAmountWidth(8));
+    try std.testing.expectEqual(@as(u16, 5), shiftAmountWidth(32));
+    try std.testing.expectEqual(@as(u16, 6), shiftAmountWidth(64));
+    try std.testing.expectEqual(@as(u16, 16), shiftAmountWidth(65535));
+
+    var width: u16 = 1;
+    while (width < 1024) : (width += 1) {
+        const bits = shiftAmountWidth(width);
+        const representable = @as(u32, 1) << @intCast(bits);
+        // Every in-range shift fits...
+        try std.testing.expect(representable >= width);
+        // ...and one bit fewer would not suffice.
+        try std.testing.expect(bits == 1 or representable / 2 < width);
+        // At a power-of-two width nothing out of range is even representable,
+        // which is what lets a consumer drop its bounds check there. Width 1 is
+        // the one exception: its only legal shift is 0, but there is no
+        // zero-width type to say so, so the amount keeps a bit that saturates.
+        if (width > 1 and std.math.isPowerOfTwo(width)) {
+            try std.testing.expectEqual(@as(u32, width), representable);
+        }
+    }
 }
 
 test {

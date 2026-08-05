@@ -90,6 +90,7 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Allocator.Error!Rej
         t.* = ir.typeOf(@enumFromInt(@as(u32, @intCast(i))));
         max_width = @max(max_width, t.width);
     }
+    assertWellFormed(ir, types);
 
     const value_limbs = Solver.valueLimbs(ir);
 
@@ -141,6 +142,66 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) Allocator.Error!Rej
     self.div_buf = try gpa.alloc(Limb, big.calcDivLimbsBufferLen(wlimbs, wlimbs));
 
     return self;
+}
+
+/// Check the IR's width invariants: a value-producing operator gives its
+/// operands one width, and a shift amount carries `Ir.shiftAmountWidth` of the
+/// operand it shifts.
+///
+/// `BddSolver` asserts the same rules while bit-blasting. Checking them here as
+/// well keeps the two engines' notion of well-formed IR identical, rather than
+/// leaving this one to quietly clamp and mask its way through input the other
+/// rejects — a divergence that would surface as two engines disagreeing about a
+/// solution set rather than as the builder bug it really is.
+///
+/// Done once at `init` rather than inside `evaluate`, which runs per draw, and
+/// skipped wholesale in builds without runtime safety.
+fn assertWellFormed(ir: *const Ir, types: []const Ir.Type) void {
+    if (!std.debug.runtime_safety) return;
+
+    const extra = ir.extra.items;
+    for (ir.nodes.items(.tag), ir.nodes.items(.data)) |tag, d| {
+        switch (tag) {
+            .add,
+            .sub,
+            .mul,
+            .sdiv,
+            .udiv,
+            .smod,
+            .umod,
+            .band,
+            .bor,
+            .bxor,
+            .eq,
+            .ne,
+            .slt,
+            .ult,
+            .sle,
+            .ule,
+            .sgt,
+            .ugt,
+            .sge,
+            .uge,
+            // A range's bounds are compared against each other and the value.
+            .range,
+            => std.debug.assert(types[d.lhs].width == types[d.rhs].width),
+
+            .sll, .srl, .sra => std.debug.assert(
+                types[d.rhs].width == Ir.shiftAmountWidth(types[d.lhs].width),
+            ),
+
+            .in => {
+                const w = types[d.lhs].width;
+                for (extra[d.rhs + 1 ..][0..extra[d.rhs]]) |member| {
+                    std.debug.assert(types[member].width == w);
+                }
+            },
+
+            // Casts exist to change width; unary and logical operators impose
+            // nothing on their operands; the rest this engine does not evaluate.
+            else => {},
+        }
+    }
 }
 
 fn freeBuffers(self: *RejectionSampler, gpa: Allocator) void {
@@ -779,6 +840,35 @@ test "wide (>64-bit) literal in a constraint" {
     for (0..200) |_| {
         try std.testing.expect(sampler.next(out));
         try std.testing.expect(out[1] >= (1 << 36)); // high limb clears the bound
+    }
+}
+
+test "variable shift, with the amount at the width the IR requires" {
+    const gpa = std.testing.allocator;
+    var ir: Ir = .{};
+    defer ir.deinit(gpa);
+
+    // x << s == 8, over an 8-bit x and the 3-bit amount that width calls for.
+    // Amounts 5..7 shift the set bit out entirely, so the saturating end of the
+    // range is reachable and the constraint really does exclude it.
+    const ty = Type.bit(8);
+    const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = ty, .kind = .rand });
+    const s = try ir.addVariable(gpa, .{
+        .id = @enumFromInt(1),
+        .ty = Type.bit(Ir.shiftAmountWidth(8)),
+        .kind = .rand,
+    });
+    const shifted = try ir.binary(gpa, .sll, try ir.varRef(gpa, x), try ir.varRef(gpa, s));
+    try constraintOne(gpa, &ir, try ir.binary(gpa, .eq, shifted, try ir.constInt(gpa, 8, ty)));
+
+    var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 17 });
+    defer sampler.deinit(gpa);
+
+    var out: [2]Value = undefined;
+    for (0..200) |_| {
+        try std.testing.expect(sampler.next(&out));
+        try std.testing.expect(out[1] <= 3); // any more shifts the bit out
+        try std.testing.expectEqual(@as(Value, 8), (out[0] << @intCast(out[1])) & 0xff);
     }
 }
 
