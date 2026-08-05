@@ -476,6 +476,107 @@ fn varType(t: Type) Type {
     return if (t.width == 0) .{ .width = default_width } else t;
 }
 
+/// A direct edge out of a node: either an operand node or a named variable.
+pub const Child = union(enum) {
+    node: Node.Index,
+    variable: Variable.Index,
+};
+
+/// Visit every direct edge out of `node` — the operand nodes it reads and the
+/// variables it names — in unspecified order. The variable-arity payloads in
+/// `extra` are decoded here, per tag, so that callers (partitioning,
+/// reachability marking, bit-blasting) need no per-tag knowledge of their own
+/// and cannot drift from the encoding documented on `Node.Tag`.
+///
+/// An absent edge (a missing `else`) is simply not visited.
+pub fn forEachChild(
+    ir: *const Ir,
+    node: Node.Index,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), Child) void,
+) void {
+    const i = @intFromEnum(node);
+    const d = ir.nodes.items(.data)[i];
+    const e = ir.extra.items;
+
+    switch (ir.nodes.items(.tag)[i]) {
+        // Leaves: the literal payload in `extra` is a magnitude, not an edge.
+        .int_literal, .bool_literal => {},
+        .var_ref => f(ctx, .{ .variable = @enumFromInt(d.lhs) }),
+
+        .neg, .bnot, .lnot, .zext, .sext, .trunc => f(ctx, .{ .node = @enumFromInt(d.lhs) }),
+
+        .add,
+        .sub,
+        .mul,
+        .sdiv,
+        .udiv,
+        .smod,
+        .umod,
+        .band,
+        .bor,
+        .bxor,
+        .sll,
+        .srl,
+        .sra,
+        .eq,
+        .ne,
+        .slt,
+        .ult,
+        .sle,
+        .ule,
+        .sgt,
+        .ugt,
+        .sge,
+        .uge,
+        .land,
+        .lor,
+        .implies,
+        .iff,
+        .range,
+        .dist_weight_eq,
+        .dist_weight_div,
+        => {
+            f(ctx, .{ .node = @enumFromInt(d.lhs) });
+            f(ctx, .{ .node = @enumFromInt(d.rhs) });
+        },
+
+        // Value node plus a counted member list in `extra`.
+        .in, .dist => {
+            f(ctx, .{ .node = @enumFromInt(d.lhs) });
+            for (e[d.rhs + 1 ..][0..e[d.rhs]]) |m| f(ctx, .{ .node = @enumFromInt(m) });
+        },
+
+        // Condition plus `[then, else]`; `else` may be the `null` sentinel.
+        .if_else => {
+            f(ctx, .{ .node = @enumFromInt(d.lhs) });
+            const then_node: Node.Index = @enumFromInt(e[d.rhs]);
+            const else_node: Node.Index = @enumFromInt(e[d.rhs + 1]);
+            f(ctx, .{ .node = then_node });
+            if (else_node != .null) f(ctx, .{ .node = else_node });
+        },
+
+        .unique => {
+            for (e[d.lhs + 1 ..][0..e[d.lhs]]) |m| f(ctx, .{ .node = @enumFromInt(m) });
+        },
+
+        // `[before_count, before..., after_count, after...]`, all variables.
+        .solve_before => {
+            const before_len = e[d.lhs];
+            for (e[d.lhs + 1 ..][0..before_len]) |v| f(ctx, .{ .variable = @enumFromInt(v) });
+            const after = d.lhs + 1 + before_len;
+            for (e[after + 1 ..][0..e[after]]) |v| f(ctx, .{ .variable = @enumFromInt(v) });
+        },
+
+        // Array variable, then `[iter_var, body_count, body...]`.
+        .foreach => {
+            f(ctx, .{ .variable = @enumFromInt(d.lhs) });
+            f(ctx, .{ .variable = @enumFromInt(e[d.rhs]) });
+            for (e[d.rhs + 2 ..][0..e[d.rhs + 1]]) |m| f(ctx, .{ .node = @enumFromInt(m) });
+        },
+    }
+}
+
 /// The statement nodes making up a constraint block's body.
 pub fn constraintBody(ir: *const Ir, index: Constraint.Index) []const Node.Index {
     const body = ir.constraints.items(.body)[@intFromEnum(index)];
