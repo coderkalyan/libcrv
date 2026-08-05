@@ -118,10 +118,16 @@ pub const Node = struct {
         add,
         sub,
         mul,
+        /// Signed division, truncated toward zero. Division by zero yields 0.
         sdiv,
+        /// Unsigned division. Division by zero yields 0.
         udiv,
-        smod,
-        umod,
+        /// Signed remainder — the sign follows the *dividend*, matching
+        /// `@rem`/SMT-LIB `bvsrem` (not `bvsmod`, which follows the divisor).
+        /// A zero divisor yields 0.
+        srem,
+        /// Unsigned remainder. A zero divisor yields 0.
+        urem,
         band,
         bor,
         bxor,
@@ -464,7 +470,7 @@ pub fn typeOf(ir: *const Ir, node: Node.Index) Type {
         .zext, .sext, .trunc => .{ .width = ir.castWidth(node) },
 
         .neg, .bnot => ir.typeOf(@enumFromInt(d.lhs)),
-        .add, .sub, .mul, .sdiv, .udiv, .smod, .umod, .band, .bor, .bxor, .sll, .srl, .sra => ir.typeOf(@enumFromInt(d.lhs)),
+        .add, .sub, .mul, .sdiv, .udiv, .srem, .urem, .band, .bor, .bxor, .sll, .srl, .sra => ir.typeOf(@enumFromInt(d.lhs)),
         .range => ir.typeOf(@enumFromInt(d.lhs)),
 
         .eq, .ne, .slt, .ult, .sle, .ule, .sgt, .ugt, .sge, .uge, .lnot, .land, .lor, .implies, .iff, .in => .{ .width = 1 },

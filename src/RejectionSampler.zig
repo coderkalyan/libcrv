@@ -269,8 +269,8 @@ fn evaluate(self: *RejectionSampler, tags: []const Ir.Node.Tag, datas: []const I
             .mul,
             .sdiv,
             .udiv,
-            .smod,
-            .umod,
+            .srem,
+            .urem,
             .band,
             .bor,
             .bxor,
@@ -389,10 +389,10 @@ fn arithNarrow(self: *RejectionSampler, tag: Ir.Node.Tag, d: Ir.Node.Data, w: u1
         .add => maskW(s[d.lhs] +% s[d.rhs], w),
         .sub => maskW(s[d.lhs] -% s[d.rhs], w),
         .mul => maskW(s[d.lhs] *% s[d.rhs], w),
-        .sdiv => sdivmod(s[d.lhs], s[d.rhs], w, .div),
+        .sdiv => sdivrem(s[d.lhs], s[d.rhs], w, .div),
         .udiv => if (s[d.rhs] == 0) 0 else s[d.lhs] / s[d.rhs],
-        .smod => sdivmod(s[d.lhs], s[d.rhs], w, .mod),
-        .umod => if (s[d.rhs] == 0) 0 else s[d.lhs] % s[d.rhs],
+        .srem => sdivrem(s[d.lhs], s[d.rhs], w, .rem),
+        .urem => if (s[d.rhs] == 0) 0 else s[d.lhs] % s[d.rhs],
         .band => s[d.lhs] & s[d.rhs],
         .bor => s[d.lhs] | s[d.rhs],
         .bxor => s[d.lhs] ^ s[d.rhs],
@@ -417,8 +417,8 @@ fn arithWide(self: *RejectionSampler, i: u32, tag: Ir.Node.Tag, d: Ir.Node.Data,
         },
         .sdiv => self.divWide(&r, d, w, .signed, .div),
         .udiv => self.divWide(&r, d, w, .unsigned, .div),
-        .smod => self.divWide(&r, d, w, .signed, .mod),
-        .umod => self.divWide(&r, d, w, .unsigned, .mod),
+        .srem => self.divWide(&r, d, w, .signed, .rem),
+        .urem => self.divWide(&r, d, w, .unsigned, .rem),
         .band => bitWide(&r, self.t0, self.wc(d.lhs), self.wc(d.rhs), .band, w),
         .bor => bitWide(&r, self.t0, self.wc(d.lhs), self.wc(d.rhs), .bor, w),
         .bxor => bitWide(&r, self.t0, self.wc(d.lhs), self.wc(d.rhs), .bxor, w),
@@ -568,7 +568,7 @@ fn bitWide(r: *Mutable, buf: []Limb, a: Const, b: Const, comptime op: enum { ban
     r.truncate(t.toConst(), .unsigned, w);
 }
 
-fn divWide(self: *RejectionSampler, r: *Mutable, d: Ir.Node.Data, w: u16, comptime s: Signedness, comptime op: enum { div, mod }) void {
+fn divWide(self: *RejectionSampler, r: *Mutable, d: Ir.Node.Data, w: u16, comptime s: Signedness, comptime op: enum { div, rem }) void {
     var b = tmp(self.t1);
     b.truncate(self.wc(d.rhs), s, w);
     if (b.eqlZero()) {
@@ -582,7 +582,7 @@ fn divWide(self: *RejectionSampler, r: *Mutable, d: Ir.Node.Data, w: u16, compti
     Mutable.divTrunc(&q, &rm, a.toConst(), b.toConst(), self.div_buf);
     const result = switch (op) {
         .div => &q,
-        .mod => &rm,
+        .rem => &rm,
     };
     r.truncate(result.toConst(), .unsigned, w);
 }
@@ -615,7 +615,7 @@ fn sra(a: u64, sh: usize, w: u16) u64 {
     return maskW(@bitCast(v >> @intCast(sh)), w);
 }
 
-fn sdivmod(a: u64, b: u64, w: u16, comptime op: enum { div, mod }) u64 {
+fn sdivrem(a: u64, b: u64, w: u16, comptime op: enum { div, rem }) u64 {
     const x = asI64(a, w);
     const y = asI64(b, w);
     if (y == 0) return 0;
@@ -623,7 +623,7 @@ fn sdivmod(a: u64, b: u64, w: u16, comptime op: enum { div, mod }) u64 {
         (if (op == .div) 0 -% x else 0)
     else switch (op) {
         .div => @divTrunc(x, y),
-        .mod => @rem(x, y),
+        .rem => @rem(x, y),
     };
     return maskW(@bitCast(r), w);
 }
@@ -736,13 +736,13 @@ test "wide (>64-bit) signed comparison" {
     }
 }
 
-test "wide (>64-bit) unsigned modulo" {
+test "wide (>64-bit) unsigned remainder" {
     const gpa = std.testing.allocator;
     var ir: Ir = .{};
     defer ir.deinit(gpa);
 
     const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(100), .kind = .rand });
-    const rem = try ir.binary(gpa, .umod, try ir.varRef(gpa, x), try ir.constInt(gpa, 100, Type.bit(100)));
+    const rem = try ir.binary(gpa, .urem, try ir.varRef(gpa, x), try ir.constInt(gpa, 100, Type.bit(100)));
     try constraintOne(gpa, &ir, try ir.binary(gpa, .eq, rem, try ir.constInt(gpa, 7, Type.bit(100))));
 
     var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 4 });
