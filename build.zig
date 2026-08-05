@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     });
     smoke_mod.addCSourceFile(.{
         .file = b.path("test/smoke.c"),
-        .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Werror" },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror" },
     });
     smoke_mod.addIncludePath(b.path("include"));
     smoke_mod.linkLibrary(static);

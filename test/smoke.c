@@ -1,5 +1,5 @@
 /*
- * Smoke test for the C API: compiles the real header as C99 and links the real
+ * Smoke test for the C API: compiles the real header as C11 and links the real
  * library, so `zig build test` proves the header is valid C and the ABI works
  * end to end. Run by the `test` step; prints nothing and exits 0 on success.
  */

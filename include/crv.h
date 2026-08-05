@@ -50,6 +50,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef __cplusplus
+/* `alignas` is a keyword in C++ and in C23, a macro from here in C11. */
+#include <stdalign.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -109,12 +114,8 @@ const char *crv_status_string(crv_status status);
  * and you are on your own. The buffer carries slack deliberately, and the
  * library refuses to compile if its representation ever outgrows it, so the
  * size is checked rather than assumed. */
-typedef union crv_ir {
-    unsigned char private_storage[128];
-    /* Never accessed. Present only to give the union the alignment the
-     * library's representation requires. */
-    uint64_t private_align_int;
-    void *private_align_ptr;
+typedef struct crv_ir {
+    alignas(8) unsigned char private_storage[128];
 } crv_ir;
 
 typedef struct crv_solver crv_solver;

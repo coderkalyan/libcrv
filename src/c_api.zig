@@ -34,7 +34,7 @@ const version = "0.1.0";
 /// Written through an out-parameter when a builder fails: `CRV_INVALID`.
 const invalid: u32 = std.math.maxInt(u32);
 
-/// The `crv_ir` union in `crv.h` is a raw byte buffer of exactly this size and
+/// The `crv_ir` struct in `crv.h` is a raw byte buffer of exactly this size and
 /// alignment, so that C code can hold an `Ir` by value without a definition of
 /// it. The buffer carries slack on purpose: growing `Ir` past it is an ABI
 /// break, and this assertion is the one moment it can be caught, so it fails
