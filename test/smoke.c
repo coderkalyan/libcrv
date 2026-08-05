@@ -40,28 +40,17 @@ int main(void) {
     CHECK(crv_ir_validate(&ir) == CRV_OK);
 
     /* A membership test is a boolean, whatever it tests. */
-    uint16_t width = 0;
-    CHECK(crv_node_width(&ir, member, &width) == CRV_OK);
-    CHECK(width == 1);
+    CHECK(crv_node_width(&ir, member) == 1);
 
-    /* Bad arguments are refused, and the out-parameter is left invalid. */
-    crv_node bad = 0;
-    CHECK(crv_node_binary(&ir, CRV_OP_ADD, xr, CRV_INVALID, &bad) ==
-          CRV_ERR_INVALID_ARGUMENT);
-    CHECK(bad == CRV_INVALID);
-    CHECK(crv_node_unary(&ir, CRV_OP_ADD, xr, &bad) ==
-          CRV_ERR_INVALID_ARGUMENT);
-
-    /* Widths only change through a cast, so mismatched operands are an error
-     * at the call that made them. */
+    /* Widths only change through a cast, so a cast is how two operands are
+     * made to agree. (Adding `xr` and `byte` directly is a precondition
+     * violation, not a status: a checked build would panic here.) */
     crv_node byte, widened, sum;
     CHECK(crv_node_const_u64(&ir, 1, 8, &byte) == CRV_OK);
-    CHECK(crv_node_binary(&ir, CRV_OP_ADD, xr, byte, &bad) ==
-          CRV_ERR_WIDTH_MISMATCH);
     CHECK(crv_node_cast(&ir, CRV_CAST_ZEXT, xr, 8, &widened) == CRV_OK);
+    CHECK(crv_node_width(&ir, widened) == 8);
     CHECK(crv_node_binary(&ir, CRV_OP_ADD, widened, byte, &sum) == CRV_OK);
-    CHECK(crv_node_width(&ir, sum, &width) == CRV_OK);
-    CHECK(width == 8);
+    CHECK(crv_node_width(&ir, sum) == 8);
 
     /* Solve. */
     crv_rejection_options options;
@@ -82,10 +71,9 @@ int main(void) {
             CHECK(crv_solver_next(solver, values, words) == CRV_OK);
             CHECK(values[0] >= 3 && values[0] <= 7);
         }
-        CHECK(crv_solver_next(solver, values, 0) == CRV_ERR_BUFFER_TOO_SMALL);
 
         crv_stats stats;
-        CHECK(crv_solver_stats(solver, &stats) == CRV_OK);
+        crv_solver_stats(solver, &stats);
         CHECK(stats.hits == 100);
         CHECK(stats.attempts >= stats.hits);
     }
@@ -95,29 +83,25 @@ int main(void) {
     /* Hash, serialize, reload, and confirm the reload is the same query. */
     {
         uint8_t before[CRV_DIGEST_LEN], after[CRV_DIGEST_LEN];
-        size_t size, written = 0;
+        size_t size;
         unsigned char *blob;
         crv_ir loaded;
         crv_var_info info;
 
-        CHECK(crv_ir_hash(&ir, before) == CRV_OK);
+        crv_ir_hash(&ir, before);
 
         size = crv_ir_serialized_size(&ir);
         CHECK(size > 0);
         blob = (unsigned char *)malloc(size);
         CHECK(blob != NULL);
-
-        CHECK(crv_ir_serialize(&ir, blob, size - 1, &written) ==
-              CRV_ERR_BUFFER_TOO_SMALL);
-        CHECK(written == size);
-        CHECK(crv_ir_serialize(&ir, blob, size, &written) == CRV_OK);
+        CHECK(crv_ir_serialize(&ir, blob, size) == CRV_OK);
 
         CHECK(crv_ir_deserialize(blob, size, &loaded) == CRV_OK);
-        CHECK(crv_ir_hash(&loaded, after) == CRV_OK);
+        crv_ir_hash(&loaded, after);
         CHECK(memcmp(before, after, CRV_DIGEST_LEN) == 0);
         CHECK(crv_var_count(&loaded) == 1);
         CHECK(crv_constraint_count(&loaded) == 1);
-        CHECK(crv_var_get(&loaded, 0, &info) == CRV_OK);
+        crv_var_get(&loaded, 0, &info);
         CHECK(info.id == 1);
         CHECK(info.width == 4);
         CHECK(info.kind == CRV_VAR_RAND);

@@ -71,6 +71,10 @@ const char *crv_version_string(void);
 
 /* -- Status ---------------------------------------------------------------
  *
+ * A status reports what a *correct* program still has to cope with: memory
+ * running out, a solver giving up, a cache blob that came off disk damaged.
+ * Malformed use of this API is not among them — see "Preconditions" below.
+ *
  * Negative values are hard errors, so `if (status < 0)` is the error test.
  * `CRV_EXHAUSTED` is a normal outcome of solving, not a failure.
  */
@@ -81,21 +85,14 @@ typedef enum crv_status {
     CRV_EXHAUSTED = 1,
 
     CRV_ERR_OOM = -1,
-    /* An out-of-range index, an unknown enum value, or a count/pointer pair
-     * that does not describe a valid array. */
-    CRV_ERR_INVALID_ARGUMENT = -2,
-    /* Operand widths disagree where the evaluator needs one width. Change
-     * width only through `crv_node_cast`. */
-    CRV_ERR_WIDTH_MISMATCH = -3,
-    CRV_ERR_BUFFER_TOO_SMALL = -4,
-    /* The IR is not structurally sound; see `crv_ir_validate`. */
-    CRV_ERR_INVALID_IR = -5,
+    /* A deserialized IR is not structurally sound. */
+    CRV_ERR_INVALID_IR = -2,
     /* The IR contains a node this solver engine cannot evaluate. */
-    CRV_ERR_UNSUPPORTED_NODE = -6,
-    CRV_ERR_BAD_MAGIC = -7,
-    CRV_ERR_UNSUPPORTED_VERSION = -8,
-    CRV_ERR_CHECKSUM_MISMATCH = -9,
-    CRV_ERR_TRUNCATED = -10
+    CRV_ERR_UNSUPPORTED_NODE = -3,
+    CRV_ERR_BAD_MAGIC = -4,
+    CRV_ERR_UNSUPPORTED_VERSION = -5,
+    CRV_ERR_CHECKSUM_MISMATCH = -6,
+    CRV_ERR_TRUNCATED = -7
 } crv_status;
 
 /* A short, static description of `status`. Never null. */
@@ -126,12 +123,31 @@ typedef uint32_t crv_constraint;
 
 #define CRV_INVALID UINT32_MAX
 
-/* An out-parameter below may be NULL to discard the result, except where the
- * result is the whole point of the call (`crv_ir_deserialize`,
- * `crv_rejection_sampler_new`). A `crv_ir *` or `crv_solver *`, by contrast, is
- * dereferenced unchecked: passing NULL is undefined, as it is for most of the C
- * standard library. `crv_solver_free(NULL)` is the one exception, so that
- * cleaning up after a failed constructor needs no guard. */
+/* -- Preconditions --------------------------------------------------------
+ *
+ * Calling this API incorrectly is a bug in your program, not a condition it
+ * has to handle, so it is asserted rather than reported. A status for it would
+ * only ask you to branch on your own mistake, and the branch could never do
+ * anything useful. The preconditions are:
+ *
+ *   - A `crv_node`, `crv_var` or `crv_constraint` names something the same
+ *     `crv_ir` produced, and so does every element of an array of them.
+ *   - A `crv_op` belongs to the entry point it is passed to: an operator with
+ *     two operands is for `crv_node_binary`, never `crv_node_unary`.
+ *   - Widths agree where an operator needs one width, which is everything
+ *     arithmetic and every comparison. Change width with `crv_node_cast`.
+ *   - Widths are non-zero, flag words contain only flags this header defines,
+ *     and a buffer is at least the size the library documented for it.
+ *   - A `crv_ir *` or `crv_solver *` is non-NULL, as with most of the C
+ *     standard library. `crv_solver_free(NULL)` is the exception, so that
+ *     cleaning up after a failed constructor needs no guard.
+ *
+ * A Debug or ReleaseSafe build of libcrv checks these and panics on the spot,
+ * pointing at the call that was wrong; a ReleaseFast build assumes them. Build
+ * against a checked library while bringing a front-end up.
+ *
+ * An out-parameter may still be NULL to discard the result, except where the
+ * result is the whole point of the call. */
 
 /* -- IR lifetime ---------------------------------------------------------- */
 
@@ -182,7 +198,7 @@ crv_status crv_var_add(crv_ir *ir, uint32_t id, uint16_t width,
                        crv_var_kind kind, crv_var *out);
 
 uint32_t crv_var_count(const crv_ir *ir);
-crv_status crv_var_get(const crv_ir *ir, crv_var v, crv_var_info *out);
+void crv_var_get(const crv_ir *ir, crv_var v, crv_var_info *out);
 
 /* -- Leaves --------------------------------------------------------------- */
 
@@ -256,11 +272,9 @@ typedef enum crv_cast {
     CRV_CAST_TRUNC = 98  /* truncate, keeping the low bits     */
 } crv_cast;
 
-/* Arity is checked: a binary op passed to `crv_node_unary` (or the reverse)
- * is `CRV_ERR_INVALID_ARGUMENT`. Arithmetic and comparison operands must have
- * equal widths (`CRV_ERR_WIDTH_MISMATCH`); shifts read the shift amount at its
- * own width, and the logical operators only test for non-zero, so those two
- * groups accept mismatched widths. */
+/* Arithmetic and comparison operands must have equal widths; shifts read the
+ * shift amount at its own width, and the logical operators only test for
+ * non-zero, so those two groups accept mismatched widths. */
 crv_status crv_node_unary(crv_ir *ir, crv_op op, crv_node a, crv_node *out);
 crv_status crv_node_binary(crv_ir *ir, crv_op op, crv_node a, crv_node b,
                            crv_node *out);
@@ -269,7 +283,7 @@ crv_status crv_node_cast(crv_ir *ir, crv_cast cast, crv_node a, uint16_t width,
 
 /* The width a node evaluates at. Resolved by walking the node's operand chain,
  * so it costs the depth of the expression, not constant time. */
-crv_status crv_node_width(const crv_ir *ir, crv_node n, uint16_t *out_width);
+uint16_t crv_node_width(const crv_ir *ir, crv_node n);
 
 /* -- Sets, distributions, structural constraints -------------------------- */
 
@@ -327,8 +341,8 @@ crv_status crv_constraint_add(crv_ir *ir, uint32_t id, uint32_t flags,
                               crv_constraint *out);
 
 uint32_t crv_constraint_count(const crv_ir *ir);
-crv_status crv_constraint_get(const crv_ir *ir, crv_constraint c,
-                              crv_constraint_info *out);
+void crv_constraint_get(const crv_ir *ir, crv_constraint c,
+                        crv_constraint_info *out);
 
 /* -- Hashing and caching --------------------------------------------------
  *
@@ -338,16 +352,15 @@ crv_status crv_constraint_get(const crv_ir *ir, crv_constraint c,
  * Serialized form is a versioned, checksummed blob. It is portable between
  * machines of the same endianness — enough for a local build cache.
  */
-crv_status crv_ir_hash(const crv_ir *ir, uint8_t out[CRV_DIGEST_LEN]);
+void crv_ir_hash(const crv_ir *ir, uint8_t out[CRV_DIGEST_LEN]);
 
 /* Exact size of this IR's serialized form. Computed without serializing. */
 size_t crv_ir_serialized_size(const crv_ir *ir);
 
-/* Write the serialized form into `buf`. If `cap` is too small, nothing is
- * written and `CRV_ERR_BUFFER_TOO_SMALL` is returned; either way `*written`
- * (when non-NULL) receives the required size. */
-crv_status crv_ir_serialize(const crv_ir *ir, void *buf, size_t cap,
-                            size_t *written);
+/* Write the serialized form into `buf`, which must have room for at least
+ * `crv_ir_serialized_size(ir)` bytes — `cap` is passed so the library can hold
+ * you to that. */
+crv_status crv_ir_serialize(const crv_ir *ir, void *buf, size_t cap);
 
 /* Rebuild an IR from bytes written by `crv_ir_serialize`, into storage the
  * caller supplies — which must not already hold an initialized IR, since this
@@ -400,7 +413,7 @@ typedef struct crv_stats {
     uint64_t hits;     /* draws accepted                              */
 } crv_stats;
 
-crv_status crv_solver_stats(const crv_solver *solver, crv_stats *out);
+void crv_solver_stats(const crv_solver *solver, crv_stats *out);
 
 #ifdef __cplusplus
 } /* extern "C" */

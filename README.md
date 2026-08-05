@@ -198,11 +198,29 @@ because its size depends on the engine behind it and a header constant sized to
 the largest one would become an ABI liability the moment a heavier backend
 lands.
 
-Every call returns a `crv_status` and writes its result through a trailing
-out-parameter (`NULL` to discard); negative statuses are hard errors, and
-`CRV_EXHAUSTED` from `crv_solver_next` is the budget running out, not a proof
-of unsatisfiability. Operators go through one `crv_node_binary(&ir, CRV_OP_ADD,
-a, b, &out)` entry point rather than one export per operator.
+A call that can fail returns a `crv_status` and writes its result through a
+trailing out-parameter (`NULL` to discard); negative statuses are hard errors,
+and `CRV_EXHAUSTED` from `crv_solver_next` is the budget running out, not a
+proof of unsatisfiability. Operators go through one `crv_node_binary(&ir,
+CRV_OP_ADD, a, b, &out)` entry point rather than one export per operator.
+
+**A status reports only what a correct program still has to cope with** —
+memory running out, a solver giving up, a cache blob that came off disk
+damaged. Calling the API wrongly is not on that list: an index that names no
+node, an operator handed to the wrong entry point, operands whose widths
+disagree, a buffer smaller than the size the library published, are all
+preconditions, asserted rather than reported. A status for them would only ask
+the caller to branch on their own bug, and the branch could never do anything
+useful — reasoning about your own malformed API usage is backwards. A Debug or
+ReleaseSafe build of libcrv panics at the offending call; a ReleaseFast build
+assumes the preconditions, as it does everywhere else. Front-end bring-up
+should link the checked build.
+
+That is also what keeps the surface small. Four exports drop their status
+entirely because nothing about them can fail (`crv_var_get`,
+`crv_constraint_get`, `crv_ir_hash`, `crv_solver_stats`), and `crv_node_width`
+becomes `uint16_t crv_node_width(const crv_ir *, crv_node)` instead of a status
+plus an out-parameter.
 
 `crv_op`, `crv_cast`, `crv_var_kind` and `crv_dist_kind` are declared with the
 IR's own enum values — `CRV_OP_ADD` *is* `Ir.Node.Tag.add` — so no table
@@ -211,25 +229,26 @@ fixed for the serialized format anyway, so the second numbering only ever bought
 the freedom to drift. `Node.Tag` is numbered in gapped classes (leaf, unary,
 binary, cast, set, structural) and `Tag.class` is the exhaustive switch that
 names them, which is what an incoming op code is checked against: passing
-`CRV_OP_ADD` to `crv_node_unary` is `CRV_ERR_INVALID_ARGUMENT`. A test
+`CRV_OP_ADD` to `crv_node_unary` trips an assertion. A test
 translates the real `crv.h` and compares every member against the enum it must
 equal, building the C names from the Zig ones, so a tag that gains a class the C
 API exposes will not compile until the header declares it.
 
-The C layer adds no logic and no state of its own — it is argument checking plus
-a call into the Zig core — but it does check what Zig's type system would
-otherwise catch: indices are bounds-checked, operand widths must agree
-(`CRV_ERR_WIDTH_MISMATCH`; change width with `crv_node_cast`), deserialized
-blobs are validated, and a solver refuses an IR containing a node it cannot
-evaluate. What it deliberately does not do is defend a C caller from hazards a
-Zig caller also has. A solver borrows its IR, and appending to that IR while the
+The C layer adds no logic and no state of its own — it is precondition checking
+plus a call into the Zig core. The checks are the ones Zig's type system makes
+for free and C cannot: a `crv_node` is a bare `uint32_t`, so bounds-checking it
+has to happen at the boundary, and it has to happen there rather than being left
+to Zig's own bounds checking, because a builder only *stores* an operand index
+and never indexes with it — an out-of-range one would sit in the IR undetected
+until `validate` rejected the whole thing.
+
+What the layer deliberately does not do is defend a C caller from hazards a Zig
+caller also has. A solver borrows its IR, and appending to that IR while the
 solver lives is undefined for both. A `crv_ir *` or `crv_solver *` is
-dereferenced unchecked, so passing NULL is undefined too — a `*Ir` cannot be
-null in Zig, and a status that conflated "you passed NULL" with a real answer
-would be worse than the segfault. (`crv_solver_free(NULL)` is the exception, so
-that cleaning up after a failed constructor needs no guard, exactly as with
-`free`.) No buffer crosses the boundary for the caller to free: where the
-library produces bytes, the caller supplies the storage.
+dereferenced unchecked, so passing NULL is undefined too. (`crv_solver_free(NULL)`
+is the exception, so that cleaning up after a failed constructor needs no guard,
+exactly as with `free`.) No buffer crosses the boundary for the caller to free:
+where the library produces bytes, the caller supplies the storage.
 
 Solutions come back in the same layout Zig sees — little-endian 64-bit words,
 `crv_value_words(&ir)` per variable — so there is no marshalling in either
