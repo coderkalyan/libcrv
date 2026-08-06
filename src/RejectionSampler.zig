@@ -48,14 +48,19 @@ ir: *const Ir,
 types: []Ir.Type,
 prng: std.Random.DefaultPrng,
 max_attempts: u32,
+/// `Value` words per variable in a solution buffer — the ABI's unit.
 value_limbs: usize,
+/// Big-int limbs per variable in `vbuf` — the host's unit. Equal to
+/// `value_limbs` wherever a limb is 64 bits, which is every 64-bit target, but
+/// the two are separate quantities and `next` repacks between them.
+var_limbs: usize,
 attempts: u64 = 0,
 hits: u64 = 0,
 
 /// Per-variable draw info, indexed by `Ir.Variable.Index`.
 vars: []VarInfo,
-/// Working copy of the drawn variable values (`value_limbs` per variable),
-/// copied to `out` on success.
+/// Working copy of the drawn variable values (`var_limbs` per variable),
+/// repacked into `out` on success.
 vbuf: []Limb,
 vlen: []usize,
 
@@ -122,8 +127,10 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) InitError!Rejection
 
     const vars = try gpa.alloc(VarInfo, ir.vars.len);
     errdefer gpa.free(vars);
+    var max_var_width: u16 = 1;
     for (ir.vars.items(.ty), vars) |ty, *vi| {
         const width: u16 = if (ty.width == 0) Ir.default_width else ty.width;
+        max_var_width = @max(max_var_width, width);
         const used = big.calcTwosCompLimbCount(width);
         const top_bits = width - (used - 1) * @bitSizeOf(Limb);
         vi.* = .{
@@ -133,6 +140,7 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) InitError!Rejection
         };
     }
 
+    const var_limbs = big.calcTwosCompLimbCount(max_var_width);
     const wlimbs = big.calcTwosCompLimbCount(max_width) + 1;
 
     var self: RejectionSampler = .{
@@ -141,6 +149,7 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) InitError!Rejection
         .prng = .init(options.seed),
         .max_attempts = options.max_attempts,
         .value_limbs = value_limbs,
+        .var_limbs = var_limbs,
         .vars = vars,
         .vbuf = &.{},
         .vlen = &.{},
@@ -156,7 +165,7 @@ pub fn init(gpa: Allocator, ir: *const Ir, options: Options) InitError!Rejection
     };
     errdefer self.freeBuffers(gpa);
 
-    self.vbuf = try gpa.alloc(Limb, value_limbs * ir.vars.len);
+    self.vbuf = try gpa.alloc(Limb, var_limbs * ir.vars.len);
     self.vlen = try gpa.alloc(usize, ir.vars.len);
     self.narrow = try gpa.alloc(u64, n);
     self.wide = try gpa.alloc(Limb, wlimbs * n);
@@ -207,13 +216,17 @@ fn nextErased(ptr: *anyopaque, out: []Value) bool {
 pub fn next(self: *RejectionSampler, out: []Value) bool {
     const tags = self.ir.nodes.items(.tag);
     const datas = self.ir.nodes.items(.data);
-    const total = self.value_limbs * self.ir.vars.len;
-    std.debug.assert(out.len >= total);
+    std.debug.assert(out.len >= self.value_limbs * self.ir.vars.len);
 
     for (0..self.max_attempts) |tries| {
         self.draw();
         if (self.evaluate(tags, datas)) {
-            for (self.vbuf[0..total], out[0..total]) |src, *dst| dst.* = @intCast(src);
+            for (0..self.ir.vars.len) |v| {
+                packValue(
+                    out[v * self.value_limbs ..][0..self.value_limbs],
+                    self.vbuf[v * self.var_limbs ..][0..self.var_limbs],
+                );
+            }
             self.attempts += @as(u64, tries) + 1;
             self.hits += 1;
             return true;
@@ -224,10 +237,12 @@ pub fn next(self: *RejectionSampler, out: []Value) bool {
 }
 
 fn draw(self: *RejectionSampler) void {
-    const vl = self.value_limbs;
+    const vl = self.var_limbs;
     for (self.vars, 0..) |vi, v| {
         const region = self.vbuf[v * vl ..][0..vl];
-        for (region[0..vi.used]) |*limb| limb.* = @intCast(self.prng.next());
+        // Truncating, not narrowing: these are random bits, and a limb is
+        // narrower than the generator's word on a 32-bit target.
+        for (region[0..vi.used]) |*limb| limb.* = @truncate(self.prng.next());
         region[vi.used - 1] &= vi.top_mask;
         for (region[vi.used..]) |*limb| limb.* = 0;
         var len = vi.used;
@@ -352,9 +367,37 @@ fn setVal(self: *RejectionSampler, i: u32, w: u16, v: u64) void {
     }
 }
 
+/// How many big-int limbs make up one 64-bit `Value`. `@divExact` rather than a
+/// rounding division on purpose: a limb is `usize`, so this is 1 or 2 on every
+/// target Zig has, and a target where it were not would be a compile error here
+/// rather than a silent misplacing of every bit above the first limb.
+const limbs_per_value = @divExact(@bitSizeOf(Value), @bitSizeOf(Limb));
+
+/// A variable's low 64 bits, gathered from as many limbs as the host uses for
+/// them. The identity `vbuf[v * var_limbs]` on a 64-bit limb.
+fn varLow(self: *const RejectionSampler, v: u32) u64 {
+    const region = self.vbuf[v * self.var_limbs ..][0..self.var_limbs];
+    var acc: u64 = 0;
+    for (region[0..@min(region.len, limbs_per_value)], 0..) |limb, k| {
+        acc |= @as(u64, limb) << @intCast(k * @bitSizeOf(Limb));
+    }
+    return acc;
+}
+
+/// Repack one variable's limbs into the little-endian 64-bit words a solution
+/// buffer is made of — a plain copy wherever a limb is already 64 bits.
+fn packValue(dst: []Solver.Value, src: []const Limb) void {
+    @memset(dst, 0);
+    for (src, 0..) |limb, k| {
+        const w = k / limbs_per_value;
+        if (w >= dst.len) break;
+        dst[w] |= @as(Solver.Value, limb) << @intCast((k % limbs_per_value) * @bitSizeOf(Limb));
+    }
+}
+
 fn varRef(self: *RejectionSampler, i: u32, w: u16, v: u32) void {
     if (w <= 64) {
-        self.narrow[i] = @intCast(self.vbuf[v * self.value_limbs]);
+        self.narrow[i] = self.varLow(v);
     } else {
         var r = self.wm(i);
         r.truncate(self.varConst(v), .unsigned, self.vars[v].width);
@@ -577,7 +620,7 @@ fn storeW(self: *RejectionSampler, i: u32, m: Mutable) void {
 }
 
 fn varConst(self: *const RejectionSampler, v: u32) Const {
-    return .{ .limbs = self.vbuf[v * self.value_limbs ..][0..self.vlen[v]], .positive = true };
+    return .{ .limbs = self.vbuf[v * self.var_limbs ..][0..self.vlen[v]], .positive = true };
 }
 
 fn tmp(buf: []Limb) Mutable {
@@ -794,8 +837,10 @@ test "wide (>64-bit) literal in a constraint" {
     // 128-bit x; constraint { x >= (1 << 100) } — a bound whose only set bit is
     // above word 1, so it exercises the wide-literal storage.
     const x = try ir.addVariable(gpa, .{ .id = @enumFromInt(0), .ty = Type.bit(128), .kind = .rand });
-    var limbs = [_]Limb{ 0, 1 << 36 }; // (1 << 36) << 64 == 1 << 100
-    const bound = try ir.constBig(gpa, .{ .limbs = &limbs, .positive = true }, Type.bit(128));
+    // Spelled as a value rather than a limb array, so the test does not assume
+    // how wide a limb is on the target.
+    var limbs: [big.calcTwosCompLimbCount(128)]Limb = undefined;
+    const bound = try ir.constBig(gpa, Mutable.init(&limbs, @as(u128, 1) << 100).toConst(), Type.bit(128));
     try constraintOne(gpa, &ir, try ir.binary(gpa, .uge, try ir.varRef(gpa, x), bound));
 
     var sampler = try RejectionSampler.init(gpa, &ir, .{ .seed = 5 });

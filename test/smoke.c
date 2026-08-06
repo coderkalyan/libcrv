@@ -21,10 +21,9 @@
 
 int main(void) {
     /* The IR is a value the caller owns; nothing here allocates it. */
-    crv_ir ir;
+    struct crv_ir ir;
     crv_ir_init(&ir);
     CHECK(crv_version_string() != NULL);
-    CHECK(crv_status_string(CRV_ERR_INVALID_IR) != NULL);
 
     /* rand bit [3:0] x;  constraint c { x inside {[3:7]}; } */
     crv_var x;
@@ -57,7 +56,7 @@ int main(void) {
     memset(&options, 0, sizeof options);
     options.seed = 0x1234;
 
-    crv_solver *solver = NULL;
+    struct crv_solver *solver = NULL;
     CHECK(crv_rejection_sampler_new(&ir, &options, &solver) == CRV_OK);
     CHECK(solver != NULL);
 
@@ -85,7 +84,7 @@ int main(void) {
         uint8_t before[CRV_DIGEST_LEN], after[CRV_DIGEST_LEN];
         size_t size;
         unsigned char *blob;
-        crv_ir loaded;
+        struct crv_ir loaded;
         crv_var_info info;
 
         crv_ir_hash(&ir, before);
@@ -121,7 +120,7 @@ int main(void) {
      * aborting the process partway through a draw. */
     {
         crv_node refs[2], distinct;
-        crv_solver *unsupported = NULL;
+        struct crv_solver *unsupported = NULL;
         refs[0] = xr;
         refs[1] = widened;
         CHECK(crv_node_unique(&ir, refs, 2, &distinct) == CRV_OK);

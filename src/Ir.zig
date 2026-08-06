@@ -1285,13 +1285,23 @@ test "deserialize rejects a checksum-valid but malformed blob" {
     try std.testing.expectError(error.InvalidIr, Ir.deserialize(gpa, tampered));
 }
 
+/// The test magnitude `(1 << 100) | 0xdead_beef`, and the limb count that holds
+/// it — spelled this way rather than as a literal limb array so the tests do not
+/// assume how wide a limb is on the target.
+const magnitude: u128 = (@as(u128, 1) << 100) | 0xdead_beef;
+
+fn bigLimbs(comptime bits: u16) usize {
+    return std.math.divCeil(usize, bits, @bitSizeOf(std.math.big.Limb)) catch unreachable;
+}
+
 test "constBits and constBig agree on the same magnitude" {
     const gpa = std.testing.allocator;
 
     var from_big: Ir = .{};
     defer from_big.deinit(gpa);
-    var limbs = [_]std.math.big.Limb{ 0xdead_beef, 1 << 36 };
-    _ = try from_big.constBig(gpa, .{ .limbs = &limbs, .positive = true }, Type.bit(128));
+    var limbs: [bigLimbs(128)]std.math.big.Limb = undefined;
+    const value = std.math.big.int.Mutable.init(&limbs, magnitude).toConst();
+    _ = try from_big.constBig(gpa, value, Type.bit(128));
 
     var from_words: Ir = .{};
     defer from_words.deinit(gpa);
@@ -1332,8 +1342,8 @@ test "wide integer literal round-trips" {
     defer ir.deinit(gpa);
 
     // A 128-bit constant with bits set above 64: (1 << 100) | 0xdead_beef.
-    var limbs = [_]std.math.big.Limb{ 0xdead_beef, 1 << 36 };
-    const value: std.math.big.int.Const = .{ .limbs = &limbs, .positive = true };
+    var limbs: [bigLimbs(128)]std.math.big.Limb = undefined;
+    const value = std.math.big.int.Mutable.init(&limbs, magnitude).toConst();
     const lit = try ir.constBig(gpa, value, Type.bit(128));
 
     try std.testing.expectEqual(@as(u16, 128), ir.typeOf(lit).width);

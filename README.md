@@ -120,9 +120,12 @@ so a mostly-narrow IR keeps its narrow nodes on the fast integer path even when
 a few nodes exceed 64 bits. The big.int ops run over the preallocated pool, so
 the hot loop never allocates.
 
-Values are little-endian limb (`u64`) vectors: each variable occupies
-`Solver.valueLimbs(ir)` limbs — 1 in the common ≤64-bit case, so `out[i]` is
-just variable `i`'s value.
+Values are little-endian `u64` vectors: each variable occupies
+`Solver.valueLimbs(ir)` words — 1 in the common ≤64-bit case, so `out[i]` is
+just variable `i`'s value. The word is 64 bits on every target, deliberately
+neither `usize` nor `std.math.big.Limb`, since this buffer is the one layout
+that crosses the C ABI. An engine whose internals are limb-based repacks on the
+way out, so libcrv builds and runs on 32-bit targets.
 
 ```zig
 var sampler = try crv.RejectionSampler.init(gpa, &ir, .{ .seed = 0 });
@@ -164,7 +167,7 @@ produced them.
 ```c
 #include <crv.h>
 
-crv_ir ir;
+struct crv_ir ir;
 crv_ir_init(&ir);
 
 crv_var x;
@@ -177,7 +180,7 @@ crv_node_range(&ir, lo, hi, &rng);                         // [3:7]
 crv_node_in(&ir, xr, &rng, 1, &member);                    // x inside {[3:7]}
 crv_constraint_add(&ir, /*id=*/2, 0, &member, 1, NULL);
 
-crv_solver *s;
+struct crv_solver *s;
 crv_rejection_sampler_new(&ir, NULL, &s);
 
 uint64_t values[1];
@@ -189,11 +192,13 @@ crv_solver_free(s);
 crv_ir_deinit(&ir);
 ```
 
-A `crv_ir` is a value, not a handle: it is the Zig `Ir` struct seen through a
-fixed-size, suitably aligned byte buffer, so C code places it on the stack or
-inside its own structures and the library never allocates it. (The library
-refuses to compile if `Ir` ever outgrows that buffer, so the size is checked
-rather than assumed.) `crv_solver` stays an opaque, library-allocated handle,
+A `struct crv_ir` is a value, not a handle: it is the Zig `Ir` struct seen
+through a fixed-size, suitably aligned byte buffer, so C code places it on the
+stack or inside its own structures and the library never allocates it. It is
+spelled out as a `struct` rather than typedef'd for that reason — it is storage
+you declare, not an opaque pointer. (The library refuses to compile if `Ir` ever
+outgrows that buffer, so the size is checked rather than assumed.)
+`struct crv_solver` stays an opaque, library-allocated handle,
 because its size depends on the engine behind it and a header constant sized to
 the largest one would become an ABI liability the moment a heavier backend
 lands.

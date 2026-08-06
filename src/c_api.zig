@@ -89,21 +89,6 @@ export fn crv_version_string() [*:0]const u8 {
     return version;
 }
 
-export fn crv_status_string(status: c_int) [*:0]const u8 {
-    const s = std.enums.fromInt(Status, status) orelse return "unknown status";
-    return switch (s) {
-        .ok => "ok",
-        .exhausted => "solver gave up within its attempt budget",
-        .err_oom => "out of memory",
-        .err_invalid_ir => "malformed IR",
-        .err_unsupported_node => "IR node unsupported by this solver",
-        .err_bad_magic => "not a libcrv cache blob",
-        .err_unsupported_version => "unsupported cache format version",
-        .err_checksum_mismatch => "cache blob failed its checksum",
-        .err_truncated => "cache blob ends mid-record",
-    };
-}
-
 // -- Handles -----------------------------------------------------------------
 
 /// What a `crv_solver *` points at. One type per handle, whichever engine is
