@@ -18,20 +18,23 @@ const Ir = @import("Ir.zig");
 
 const Solver = @This();
 
-/// One limb of a variable's value (a 64-bit little-endian word).
+/// One word of a variable's value: 64 bits on every target, deliberately not
+/// `usize` and deliberately not `std.math.big.Limb`. A solution buffer is the
+/// one layout that crosses the ABI, so it cannot depend on the host.
 pub const Value = u64;
 
-/// Number of limbs each variable value occupies in a solution buffer:
+/// Number of `Value` words each variable occupies in a solution buffer:
 /// `ceil(maxVarWidth / 64)`, at least 1. Solver-agnostic — it depends only on
 /// the IR's variable widths — so callers size `out` as `valueLimbs(ir) *
-/// ir.vars.len`.
+/// ir.vars.len`. An engine whose internal representation is limb-based has to
+/// repack into this on the way out; that is its problem, not the caller's.
 pub fn valueLimbs(ir: *const Ir) usize {
     var max_width: u16 = 1;
     for (ir.vars.items(.ty)) |ty| {
         const w: u16 = if (ty.width == 0) 64 else ty.width;
         max_width = @max(max_width, w);
     }
-    return std.math.big.int.calcTwosCompLimbCount(max_width);
+    return std.math.divCeil(usize, max_width, @bitSizeOf(Value)) catch unreachable;
 }
 
 /// Pointer to the concrete solver instance.

@@ -1,7 +1,8 @@
 # libcrv
 
-A Zig library. This is an initial scaffold — replace the placeholder API in
-`src/root.zig` with the real thing.
+A constrained random verification library: build a constraint set into a
+compact IR, hash or cache it, and draw satisfying assignments from it. Usable
+from Zig as a module, and from C through [`include/crv.h`](include/crv.h).
 
 ## Requirements
 
@@ -10,8 +11,8 @@ A Zig library. This is an initial scaffold — replace the placeholder API in
 ## Building and testing
 
 ```sh
-zig build          # build the static library into zig-out/
-zig build test     # run the unit tests
+zig build          # static + shared C library and the header into zig-out/
+zig build test     # Zig unit tests, C API tests, and the C smoke test
 ```
 
 ## Using it as a dependency
@@ -76,7 +77,16 @@ Because it is all plain POD arrays:
   from a byte buffer behind a `magic` + 32-bit `format_version` header, with a
   trailing Blake3 checksum that is verified *before* any length is trusted — so
   a corrupt or tampered cache file fails cleanly rather than driving an
-  allocation off a garbage count.
+  allocation off a garbage count. `ir.serializedSize()` gives the exact length
+  without serializing, for callers that want to supply the buffer.
+
+`ir.validate(gpa)` is the pass that makes it safe to walk an IR nobody vetted:
+every operand index must exist and refer *backwards* (evaluation is one forward
+sweep, so this is what makes the tree acyclic and in evaluation order), every
+`extra` payload must lie inside the pool, and operand widths must agree wherever
+the evaluator assumes a single width. `deserialize` runs it before returning, so
+a blob that survives the checksum and the pass can be consumed without bounds
+checks.
 
 The node tags cover the scalar constraint subset (bit-vector randomization,
 arithmetic/relational/logical ops, `in`, `zext`/`sext`/`trunc` sizing casts,
@@ -110,9 +120,12 @@ so a mostly-narrow IR keeps its narrow nodes on the fast integer path even when
 a few nodes exceed 64 bits. The big.int ops run over the preallocated pool, so
 the hot loop never allocates.
 
-Values are little-endian limb (`u64`) vectors: each variable occupies
-`Solver.valueLimbs(ir)` limbs — 1 in the common ≤64-bit case, so `out[i]` is
-just variable `i`'s value.
+Values are little-endian `u64` vectors: each variable occupies
+`Solver.valueLimbs(ir)` words — 1 in the common ≤64-bit case, so `out[i]` is
+just variable `i`'s value. The word is 64 bits on every target, deliberately
+neither `usize` nor `std.math.big.Limb`, since this buffer is the one layout
+that crosses the C ABI. An engine whose internals are limb-based repacks on the
+way out, so libcrv builds and runs on 32-bit targets.
 
 ```zig
 var sampler = try crv.RejectionSampler.init(gpa, &ir, .{ .seed = 0 });
@@ -139,18 +152,125 @@ everything else propagates its operand type or yields a 1-bit `bool`.
 It is incomplete — a `false` result means "no assignment found within the
 attempt budget", not "unsatisfiable". The interpreter covers the scalar
 expression subset (arithmetic/bitwise/shift, comparisons, logical ops,
-`in`/`range`) and tracks cumulative `attempts`/`hits` counters; evaluating an unsupported node
-(`dist` or the structural constraints) panics for now.
+`in`/`range`) and tracks cumulative `attempts`/`hits` counters. `dist` and the
+structural constraints are roadmap: `RejectionSampler.supports` says so, and
+`init` rejects an IR that uses one with `error.UnsupportedNode` rather than
+giving up partway through a draw.
+
+## The C API
+
+`zig build` installs `libcrv.a`, `libcrv.so` and `crv.h`. The header is
+hand-written and declaration-only, so bindgen, cffi and DPI can all parse it.
+Nodes, variables and constraints are `uint32_t` indices into the IR that
+produced them.
+
+```c
+#include <crv.h>
+
+struct crv_ir ir;
+crv_ir_init(&ir);
+
+crv_var x;
+crv_node xr, lo, hi, rng, member;
+crv_var_add(&ir, /*id=*/1, /*width=*/4, CRV_VAR_RAND, &x); // rand bit [3:0] x;
+crv_node_var(&ir, x, &xr);
+crv_node_const_u64(&ir, 3, 4, &lo);
+crv_node_const_u64(&ir, 7, 4, &hi);
+crv_node_range(&ir, lo, hi, &rng);                         // [3:7]
+crv_node_in(&ir, xr, &rng, 1, &member);                    // x inside {[3:7]}
+crv_constraint_add(&ir, /*id=*/2, 0, &member, 1, NULL);
+
+struct crv_solver *s;
+crv_rejection_sampler_new(&ir, NULL, &s);
+
+uint64_t values[1];
+if (crv_solver_next(s, values, 1) == CRV_OK) {
+    printf("x = %llu\n", (unsigned long long)values[0]);
+}
+
+crv_solver_free(s);
+crv_ir_deinit(&ir);
+```
+
+A `struct crv_ir` is a value, not a handle: it is the Zig `Ir` struct seen
+through a fixed-size, suitably aligned byte buffer, so C code places it on the
+stack or inside its own structures and the library never allocates it. It is
+spelled out as a `struct` rather than typedef'd for that reason — it is storage
+you declare, not an opaque pointer. (The library refuses to compile if `Ir` ever
+outgrows that buffer, so the size is checked rather than assumed.)
+`struct crv_solver` stays an opaque, library-allocated handle,
+because its size depends on the engine behind it and a header constant sized to
+the largest one would become an ABI liability the moment a heavier backend
+lands.
+
+A call that can fail returns a `crv_status` and writes its result through a
+trailing out-parameter (`NULL` to discard); negative statuses are hard errors,
+and `CRV_EXHAUSTED` from `crv_solver_next` is the budget running out, not a
+proof of unsatisfiability. Operators go through one `crv_node_binary(&ir,
+CRV_OP_ADD, a, b, &out)` entry point rather than one export per operator.
+
+**A status reports only what a correct program still has to cope with** —
+memory running out, a solver giving up, a cache blob that came off disk
+damaged. Calling the API wrongly is not on that list: an index that names no
+node, an operator handed to the wrong entry point, operands whose widths
+disagree, a buffer smaller than the size the library published, are all
+preconditions, asserted rather than reported. A status for them would only ask
+the caller to branch on their own bug, and the branch could never do anything
+useful — reasoning about your own malformed API usage is backwards. A Debug or
+ReleaseSafe build of libcrv panics at the offending call; a ReleaseFast build
+assumes the preconditions, as it does everywhere else. Front-end bring-up
+should link the checked build.
+
+That is also what keeps the surface small. Four exports drop their status
+entirely because nothing about them can fail (`crv_var_get`,
+`crv_constraint_get`, `crv_ir_hash`, `crv_solver_stats`), and `crv_node_width`
+becomes `uint16_t crv_node_width(const crv_ir *, crv_node)` instead of a status
+plus an out-parameter.
+
+`crv_op`, `crv_cast`, `crv_var_kind` and `crv_dist_kind` are declared with the
+IR's own enum values — `CRV_OP_ADD` *is* `Ir.Node.Tag.add` — so no table
+translates between a "wire" numbering and an internal one. Those values are
+fixed for the serialized format anyway, so the second numbering only ever bought
+the freedom to drift. `Node.Tag` is numbered in gapped classes (leaf, unary,
+binary, cast, set, structural) and `Tag.class` is the exhaustive switch that
+names them, which is what an incoming op code is checked against: passing
+`CRV_OP_ADD` to `crv_node_unary` trips an assertion. A test
+translates the real `crv.h` and compares every member against the enum it must
+equal, building the C names from the Zig ones, so a tag that gains a class the C
+API exposes will not compile until the header declares it.
+
+The C layer adds no logic and no state of its own — it is precondition checking
+plus a call into the Zig core. The checks are the ones Zig's type system makes
+for free and C cannot: a `crv_node` is a bare `uint32_t`, so bounds-checking it
+has to happen at the boundary, and it has to happen there rather than being left
+to Zig's own bounds checking, because a builder only *stores* an operand index
+and never indexes with it — an out-of-range one would sit in the IR undetected
+until `validate` rejected the whole thing.
+
+What the layer deliberately does not do is defend a C caller from hazards a Zig
+caller also has. A solver borrows its IR, and appending to that IR while the
+solver lives is undefined for both. A `crv_ir *` or `crv_solver *` is
+dereferenced unchecked, so passing NULL is undefined too. (`crv_solver_free(NULL)`
+is the exception, so that cleaning up after a failed constructor needs no guard,
+exactly as with `free`.) No buffer crosses the boundary for the caller to free:
+where the library produces bytes, the caller supplies the storage.
+
+Solutions come back in the same layout Zig sees — little-endian 64-bit words,
+`crv_value_words(&ir)` per variable — so there is no marshalling in either
+direction; wide literals go in the same way through `crv_node_const_bits`.
 
 ## Layout
 
 ```
-build.zig                # build graph: module, static library, test step
+build.zig                # build graph: Zig module, C library, test step
 build.zig.zon            # package manifest (name, version, dependencies)
-src/root.zig             # library root — the public API
+include/crv.h            # the public C header
+src/root.zig             # Zig module root — the public API
+src/c_api.zig            # C ABI bindings; root of the C library artifact
 src/Ir.zig               # the flattened-tree IR
 src/Solver.zig           # the swappable solver interface
 src/RejectionSampler.zig # the rejection-sampling engine
+test/smoke.c             # C smoke test, compiled and run by `zig build test`
 ```
 
 ## License
